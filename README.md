@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-当前仓库处于设计阶段，尚未进入代码实现。
+当前仓库已具备最小前后端 TypeScript 脚手架，但尚未进入业务功能实现。
 
 已完成内容：
 
@@ -17,14 +17,63 @@
 - 浏览器 Web Speech API 与浏览器 TTS 策略
 - 关键帧采样、成本控制与隐私边界
 - 错误处理与验收标准
+- Vite + React + TypeScript 前端基础工程
+- Node/Express + TypeScript 后端基础工程
+- 根目录 `npm run dev`、`npm test`、`npm run build`、`npm run typecheck` 脚本
 
 尚未完成内容：
 
-- Vite + React + TypeScript 前端应用
-- Node/Express 后端服务
+- 摄像头预览、麦克风采集和语音转写
 - 多模态模型 provider 真实调用
-- 摄像头、麦克风、ASR、TTS 的端到端联调
-- 自动化测试与真实运行验证
+- ASR、TTS 的端到端联调
+- 限流、成本估算和会话上下文管理
+
+## 本地运行
+
+安装依赖：
+
+```bash
+npm install
+```
+
+启动前后端开发服务：
+
+```bash
+npm run dev
+```
+
+运行测试：
+
+```bash
+npm test
+```
+
+类型检查：
+
+```bash
+npm run typecheck
+```
+
+构建：
+
+```bash
+npm run build
+```
+
+后端当前仅提供健康检查接口：
+
+```text
+GET /api/health
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "service": "ai-vision-voice-chat-api"
+}
+```
 
 ## 核心设计
 
