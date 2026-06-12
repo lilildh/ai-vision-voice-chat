@@ -18,6 +18,7 @@ type Keyframe = {
 };
 
 const serviceName = "ai-vision-voice-chat-api";
+const maxKeyframesPerTurn = 3;
 
 function stopMediaStream(stream: MediaStream | null) {
   stream?.getTracks().forEach((track) => {
@@ -154,6 +155,11 @@ export function App() {
   function captureKeyframe() {
     if (!isSessionActive || !mediaStream) {
       setErrorMessage("请先启动会话，再截取关键帧。");
+      return;
+    }
+
+    if (keyframes.length >= maxKeyframesPerTurn) {
+      setErrorMessage(`每轮最多保留 ${maxKeyframesPerTurn} 张关键帧。`);
       return;
     }
 

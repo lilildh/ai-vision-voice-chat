@@ -2,11 +2,21 @@ import express from "express";
 
 import { isMalformedJsonRequestError } from "./app-error-handler";
 import { CONVERSATION_BODY_LIMIT } from "./conversation-contract";
-import { handleConversationTurn } from "./conversation-route";
+import { createCostControlService } from "./cost-control";
+import {
+  type CostControlService,
+  createConversationTurnHandler
+} from "./conversation-route";
 import { createZeroCost } from "./conversation-validation";
 
-export function createApp() {
+type CreateAppOptions = {
+  costControlService?: CostControlService;
+};
+
+export function createApp(options: CreateAppOptions = {}) {
   const app = express();
+  const costControlService =
+    options.costControlService ?? createCostControlService();
 
   app.use(express.json({ limit: CONVERSATION_BODY_LIMIT }));
 
@@ -17,7 +27,10 @@ export function createApp() {
     });
   });
 
-  app.post("/api/conversation-turn", handleConversationTurn);
+  app.post(
+    "/api/conversation-turn",
+    createConversationTurnHandler(costControlService)
+  );
 
   app.use(
     (

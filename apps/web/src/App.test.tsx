@@ -136,4 +136,48 @@ describe("App", () => {
     getContext.mockRestore();
     toDataUrl.mockRestore();
   });
+
+  it("keeps the keyframe preview capped at three frames", async () => {
+    const mediaStream = {
+      getTracks: () => [{ stop: vi.fn() }]
+    } as unknown as MediaStream;
+    const getUserMedia = vi.fn().mockResolvedValue(mediaStream);
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue({
+        drawImage: vi.fn()
+      } as unknown as CanvasRenderingContext2D);
+    const toDataUrl = vi
+      .spyOn(HTMLCanvasElement.prototype, "toDataURL")
+      .mockReturnValue("data:image/png;base64,real-frame");
+
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia }
+    });
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始会话" }));
+
+    await screen.findByLabelText("实时摄像头预览");
+
+    const captureButton = screen.getByRole("button", { name: "截取关键帧" });
+
+    fireEvent.click(captureButton);
+    fireEvent.click(captureButton);
+    fireEvent.click(captureButton);
+
+    await waitFor(() => {
+      expect(screen.getByAltText("关键帧 3")).toBeInTheDocument();
+    });
+
+    fireEvent.click(captureButton);
+
+    expect(screen.getByText("每轮最多保留 3 张关键帧。")).toBeInTheDocument();
+    expect(screen.queryByAltText("关键帧 4")).not.toBeInTheDocument();
+
+    getContext.mockRestore();
+    toDataUrl.mockRestore();
+  });
 });

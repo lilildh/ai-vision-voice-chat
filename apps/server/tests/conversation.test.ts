@@ -2,6 +2,7 @@ import { createRequest, createResponse } from "node-mocks-http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../src/app";
+import { createCostControlService } from "../src/cost-control";
 
 type RequestBody = {
   keyframes?: unknown[];
@@ -10,6 +11,10 @@ type RequestBody = {
 };
 
 const originalModelEnv = {
+  COST_IMAGE_TOKENS_PER_KEYFRAME: process.env.COST_IMAGE_TOKENS_PER_KEYFRAME,
+  COST_INPUT_USD_PER_1M_TOKENS: process.env.COST_INPUT_USD_PER_1M_TOKENS,
+  COST_OUTPUT_USD_PER_1M_TOKENS: process.env.COST_OUTPUT_USD_PER_1M_TOKENS,
+  MODEL_MAX_OUTPUT_TOKENS: process.env.MODEL_MAX_OUTPUT_TOKENS,
   MODEL_API_KEY: process.env.MODEL_API_KEY,
   MODEL_BASE_URL: process.env.MODEL_BASE_URL,
   MODEL_NAME: process.env.MODEL_NAME
@@ -50,7 +55,10 @@ function validRequestBody(overrides: RequestBody = {}) {
   };
 }
 
-function postConversationTurn(body: unknown) {
+function postConversationTurn(
+  body: unknown,
+  app = createApp()
+) {
   const request = createRequest({
     body,
     headers: {
@@ -60,7 +68,6 @@ function postConversationTurn(body: unknown) {
     url: "/api/conversation-turn"
   });
   const response = createResponse();
-  const app = createApp();
 
   app.use((_request, fallbackResponse) => {
     fallbackResponse.status(404).json({
@@ -93,6 +100,10 @@ describe("POST /api/conversation-turn", () => {
     delete process.env.MODEL_API_KEY;
     delete process.env.MODEL_BASE_URL;
     delete process.env.MODEL_NAME;
+    delete process.env.COST_IMAGE_TOKENS_PER_KEYFRAME;
+    delete process.env.COST_INPUT_USD_PER_1M_TOKENS;
+    delete process.env.COST_OUTPUT_USD_PER_1M_TOKENS;
+    delete process.env.MODEL_MAX_OUTPUT_TOKENS;
   });
 
   afterEach(() => {
@@ -247,13 +258,121 @@ describe("POST /api/conversation-turn", () => {
       cost: {
         request: {
           cloudCallAttempted: false,
+          estimatedInputTokens: 852,
+          estimatedOutputTokens: 512,
+          estimatedUsd: 0.01194,
           imageBytes: 5,
           inputTextChars: 7,
           keyframeCount: 1
+        },
+        session: {
+          estimatedUsd: 0.01194,
+          keyframeCount: 1,
+          requestCount: 1
         }
       },
       error: {
         code: "MODEL_PROVIDER_NOT_IMPLEMENTED",
+        retryable: false
+      },
+      ok: false
+    });
+  });
+
+  it("rejects the seventh valid request in the current minute", () => {
+    process.env.MODEL_API_KEY = "test-key";
+    process.env.MODEL_BASE_URL = "https://model.example.test/v1";
+    process.env.MODEL_NAME = "vision-model";
+
+    const app = createApp();
+
+    Array.from({ length: 6 }, () => {
+      const response = postConversationTurn(validRequestBody(), app);
+
+      expect(response.status).toBe(501);
+      expect(response.body).toMatchObject({
+        error: {
+          code: "MODEL_PROVIDER_NOT_IMPLEMENTED"
+        }
+      });
+    });
+
+    const response = postConversationTurn(validRequestBody(), app);
+
+    expect(response.status).toBe(429);
+    expect(response.body).toMatchObject({
+      error: {
+        code: "RATE_LIMITED",
+        details: {
+          limit: 6,
+          windowMs: 60_000
+        },
+        retryable: true
+      },
+      ok: false
+    });
+    expect(response.body.error.details.retryAfterMs).toBeGreaterThan(0);
+  });
+
+  it("rejects the twenty-first valid turn in one session", () => {
+    process.env.MODEL_API_KEY = "test-key";
+    process.env.MODEL_BASE_URL = "https://model.example.test/v1";
+    process.env.MODEL_NAME = "vision-model";
+
+    const app = createApp({
+      costControlService: createCostControlService({
+        rateLimit: { limit: 100, windowMs: 60_000 }
+      })
+    });
+
+    Array.from({ length: 20 }, () => {
+      const response = postConversationTurn(validRequestBody(), app);
+
+      expect(response.status).toBe(501);
+      expect(response.body).toMatchObject({
+        error: {
+          code: "MODEL_PROVIDER_NOT_IMPLEMENTED"
+        }
+      });
+    });
+
+    const response = postConversationTurn(validRequestBody(), app);
+
+    expect(response.status).toBe(429);
+    expect(response.body).toMatchObject({
+      error: {
+        code: "SESSION_TURN_LIMIT_EXCEEDED",
+        details: {
+          currentTurnCount: 20,
+          limit: 20,
+          sessionId: "session-1"
+        },
+        retryable: false
+      },
+      ok: false
+    });
+  });
+
+  it("rejects invalid cost configuration with an explicit error", () => {
+    process.env.MODEL_API_KEY = "test-key";
+    process.env.MODEL_BASE_URL = "https://model.example.test/v1";
+    process.env.MODEL_NAME = "vision-model";
+    process.env.COST_OUTPUT_USD_PER_1M_TOKENS = "free";
+
+    const response = postConversationTurn(validRequestBody());
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      error: {
+        code: "COST_CONFIG_INVALID",
+        details: {
+          invalid: [
+            {
+              name: "COST_OUTPUT_USD_PER_1M_TOKENS",
+              value: "free"
+            }
+          ]
+        },
         retryable: false
       },
       ok: false
