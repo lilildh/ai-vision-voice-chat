@@ -1,7 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import "./App.css";
 import cameraFeedUrl from "./assets/camera-feed-reference.png";
+import {
+  type ConversationMessage,
+  type ConversationSessionStats,
+  postConversationTurn
+} from "./conversation-client";
+import {
+  type CapturedKeyframe,
+  captureCompressedKeyframe,
+  maxKeyframesPerTurn
+} from "./frame-capture";
 
 type BackendStatus = "checking" | "online" | "offline";
 type SessionStatus = "idle" | "starting" | "active" | "error";
@@ -11,14 +21,12 @@ type HealthResponse = {
   service: string;
 };
 
-type Keyframe = {
-  capturedAt: Date;
-  id: string;
-  src: string;
-};
-
 const serviceName = "ai-vision-voice-chat-api";
-const maxKeyframesPerTurn = 3;
+const initialStats: ConversationSessionStats = {
+  estimatedUsd: 0,
+  keyframeCount: 0,
+  requestCount: 0
+};
 
 function stopMediaStream(stream: MediaStream | null) {
   stream?.getTracks().forEach((track) => {
@@ -31,7 +39,29 @@ function getErrorMessage(error: unknown) {
     return error.message;
   }
 
-  return "无法访问摄像头或麦克风，请检查浏览器权限。";
+  return "无法访问摄像头，请检查浏览器权限。";
+}
+
+function createSessionId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function formatUsd(value: number) {
+  return `$${value.toFixed(6)}`;
+}
+
+function toRequestKeyframe(keyframe: CapturedKeyframe) {
+  return {
+    capturedAt: keyframe.capturedAt,
+    dataUrl: keyframe.dataUrl,
+    height: keyframe.height,
+    id: keyframe.id,
+    width: keyframe.width
+  };
 }
 
 export function App() {
@@ -41,8 +71,14 @@ export function App() {
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
-  const [keyframes, setKeyframes] = useState<Keyframe[]>([]);
+  const [keyframes, setKeyframes] = useState<CapturedKeyframe[]>([]);
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionStats, setSessionStats] =
+    useState<ConversationSessionStats>(initialStats);
   const [sessionStartedAt, setSessionStartedAt] = useState<Date | null>(null);
+  const [promptText, setPromptText] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const isSessionActive = sessionStatus === "active";
@@ -66,7 +102,8 @@ export function App() {
     ? sessionStartedAt.toLocaleTimeString("zh-CN", { hour12: false })
     : "未连接";
   const latencyLabel = latencyMs === null ? "--" : `${latencyMs}ms`;
-  const modelCostLabel = "$0.000";
+  const frameCountLabel = `${keyframes.length} / ${maxKeyframesPerTurn}`;
+  const modelCostLabel = formatUsd(sessionStats.estimatedUsd);
 
   useEffect(() => {
     let isMounted = true;
@@ -117,7 +154,7 @@ export function App() {
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setSessionStatus("error");
-      setErrorMessage("当前浏览器不支持摄像头或麦克风访问。");
+      setErrorMessage("当前浏览器不支持摄像头访问。");
       return;
     }
 
@@ -127,16 +164,21 @@ export function App() {
       stopMediaStream(mediaStream);
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: false,
         video: true
       });
 
       setMediaStream(stream);
       setKeyframes([]);
+      setMessages([]);
+      setPromptText("");
+      setSessionStats(initialStats);
+      setSessionId(createSessionId());
       setSessionStartedAt(new Date());
       setSessionStatus("active");
     } catch (error) {
       setMediaStream(null);
+      setSessionId(null);
       setSessionStartedAt(null);
       setSessionStatus("error");
       setErrorMessage(getErrorMessage(error));
@@ -147,58 +189,127 @@ export function App() {
     stopMediaStream(mediaStream);
     setMediaStream(null);
     setKeyframes([]);
+    setMessages([]);
+    setPromptText("");
+    setSessionStats(initialStats);
+    setSessionId(null);
     setSessionStartedAt(null);
     setSessionStatus("idle");
     setErrorMessage(null);
   }
 
-  function captureKeyframe() {
+  function captureFrame(frameIndex: number) {
     if (!isSessionActive || !mediaStream) {
-      setErrorMessage("请先启动会话，再截取关键帧。");
-      return;
-    }
-
-    if (keyframes.length >= maxKeyframesPerTurn) {
-      setErrorMessage(`每轮最多保留 ${maxKeyframesPerTurn} 张关键帧。`);
-      return;
+      throw new Error("请先启动摄像头，再截取关键帧。");
     }
 
     const video = videoRef.current;
 
     if (!video) {
-      setErrorMessage("实时视频尚未挂载，请稍后再试。");
-      return;
+      throw new Error("实时视频尚未挂载，请稍后再试。");
     }
 
-    const width = video.videoWidth || 640;
-    const height = video.videoHeight || 360;
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
+    return captureCompressedKeyframe(video, {
+      id: `frame-${Date.now()}-${frameIndex + 1}`
+    });
+  }
 
-    if (!context) {
-      setErrorMessage("当前浏览器无法从视频生成关键帧。");
+  function captureKeyframe() {
+    if (keyframes.length >= maxKeyframesPerTurn) {
+      setErrorMessage(`每轮最多保留 ${maxKeyframesPerTurn} 张关键帧。`);
       return;
     }
-
-    context.drawImage(video, 0, 0, width, height);
 
     try {
-      const capturedAt = new Date();
-      const src = canvas.toDataURL("image/png");
+      const keyframe = captureFrame(keyframes.length);
 
       setErrorMessage(null);
-      setKeyframes((currentKeyframes) => [
-        ...currentKeyframes,
+      setKeyframes((currentKeyframes) => [...currentKeyframes, keyframe]);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  }
+
+  async function submitTextQuestion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const text = promptText.trim();
+
+    if (!text) {
+      setErrorMessage("请输入文本问题。");
+      return;
+    }
+
+    if (!isSessionActive || !mediaStream) {
+      setErrorMessage("请先启动摄像头，再发送文本问题。");
+      return;
+    }
+
+    let requestKeyframes = keyframes;
+
+    if (requestKeyframes.length === 0) {
+      try {
+        requestKeyframes = [captureFrame(0)];
+        setKeyframes(requestKeyframes);
+      } catch (error) {
+        setErrorMessage(getErrorMessage(error));
+        return;
+      }
+    }
+
+    const activeSessionId = sessionId ?? createSessionId();
+    const requestMessages = messages.map((message) => ({
+      createdAt: message.createdAt,
+      role: message.role,
+      text: message.text
+    }));
+
+    if (!sessionId) {
+      setSessionId(activeSessionId);
+    }
+
+    setIsSubmitting(true);
+    setErrorMessage(null);
+
+    try {
+      const response = await postConversationTurn({
+        keyframes: requestKeyframes.map(toRequestKeyframe),
+        session: {
+          messages: requestMessages,
+          sessionId: activeSessionId,
+          stats: sessionStats
+        },
+        text
+      });
+
+      setLatencyMs(response.timing.totalMs);
+      setSessionStats(response.cost.session);
+
+      if (!response.ok) {
+        setErrorMessage(`${response.error.code}：${response.error.message}`);
+        return;
+      }
+
+      const now = new Date().toISOString();
+
+      setMessages((currentMessages) => [
+        ...currentMessages,
         {
-          capturedAt,
-          id: `${capturedAt.getTime()}-${currentKeyframes.length + 1}`,
-          src
+          createdAt: now,
+          role: "user",
+          text
+        },
+        {
+          createdAt: new Date().toISOString(),
+          role: "assistant",
+          text: response.reply.text
         }
       ]);
-    } catch {
-      setErrorMessage("关键帧生成失败，请确认摄像头画面可用。");
+      setPromptText("");
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
@@ -223,7 +334,7 @@ export function App() {
         </div>
       </header>
 
-      <main className="workspace" aria-label="AI 视觉语音桌面工作台">
+      <main className="workspace" aria-label="AI 视觉文本桌面工作台">
         <section className="vision-panel" aria-label="摄像头画面">
           <div className={`camera-feed ${isSessionActive ? "active" : ""}`}>
             {isSessionActive ? (
@@ -267,51 +378,83 @@ export function App() {
           </div>
         </section>
 
-        <section className="chat-panel" aria-label="语音对话">
+        <section className="chat-panel" aria-label="文本对话">
           <div className="chat-scroll">
             <div className="session-chip">当前会话</div>
 
             {isSessionActive ? (
-              <article className="message assistant-message">
-                <div className="assistant-row">
-                  <div className="assistant-avatar" aria-hidden="true">
-                    <span className="icon-memory" />
-                  </div>
-                  <div className="message-bubble assistant-bubble">
-                    <p>摄像头和麦克风已连接，等待真实语音输入。</p>
-                    <div className="keyframe-strip" aria-label="关键帧预览">
-                      {keyframes.length > 0 ? (
-                        keyframes.map((keyframe, index) => (
-                          <figure className="keyframe-card" key={keyframe.id}>
-                            <img
-                              src={keyframe.src}
-                              alt={`关键帧 ${index + 1}`}
-                            />
-                            <figcaption>
-                              {keyframe.capturedAt.toLocaleTimeString("zh-CN", {
-                                hour12: false
-                              })}
-                            </figcaption>
-                          </figure>
-                        ))
-                      ) : (
-                        <span className="empty-keyframes">暂无关键帧</span>
-                      )}
+              <>
+                <article className="message assistant-message">
+                  <div className="assistant-row">
+                    <div className="assistant-avatar" aria-hidden="true">
+                      <span className="icon-memory" />
+                    </div>
+                    <div className="message-bubble assistant-bubble">
+                      <p>摄像头已连接，可以输入文本问题验证视觉链路。</p>
+                      <div className="keyframe-strip" aria-label="关键帧预览">
+                        {keyframes.length > 0 ? (
+                          keyframes.map((keyframe, index) => (
+                            <figure className="keyframe-card" key={keyframe.id}>
+                              <img
+                                src={keyframe.previewUrl}
+                                alt={`关键帧 ${index + 1}`}
+                              />
+                              <figcaption>
+                                {new Date(keyframe.capturedAt).toLocaleTimeString(
+                                  "zh-CN",
+                                  {
+                                    hour12: false
+                                  }
+                                )}
+                              </figcaption>
+                            </figure>
+                          ))
+                        ) : (
+                          <span className="empty-keyframes">暂无关键帧</span>
+                        )}
+                      </div>
                     </div>
                   </div>
+                </article>
+
+                <div className="message-list">
+                  {messages.map((message, index) => (
+                    <article
+                      className={`message ${
+                        message.role === "user"
+                          ? "user-message"
+                          : "assistant-message"
+                      }`}
+                      key={`${message.createdAt}-${index}`}
+                    >
+                      {message.role === "assistant" ? (
+                        <div className="assistant-row">
+                          <div className="assistant-avatar" aria-hidden="true">
+                            <span className="icon-memory" />
+                          </div>
+                          <div className="message-bubble assistant-bubble">
+                            <p>{message.text}</p>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="message-bubble user-bubble">
+                          <p>{message.text}</p>
+                        </div>
+                      )}
+                    </article>
+                  ))}
                 </div>
-              </article>
+              </>
             ) : (
               <div className="empty-session" role="status">
                 <p>会话尚未开始</p>
-                <span>启动会话后才会接入浏览器摄像头和麦克风。</span>
+                <span>启动会话后才会接入浏览器摄像头。</span>
               </div>
             )}
 
-            {isSessionActive ? (
-              <div className="listening-indicator">
-                <span className="equalizer" aria-hidden="true" />
-                <span>等待语音输入</span>
+            {isSubmitting ? (
+              <div className="submitting-note" role="status">
+                正在发送文本和关键帧
               </div>
             ) : null}
 
@@ -323,6 +466,27 @@ export function App() {
           </div>
 
           <footer className="control-dock">
+            <form className="prompt-form" onSubmit={submitTextQuestion}>
+              <textarea
+                aria-label="文本问题"
+                className="prompt-textarea"
+                disabled={isSubmitting}
+                onChange={(event) => setPromptText(event.target.value)}
+                placeholder="输入你想让 AI 结合画面回答的问题"
+                rows={3}
+                value={promptText}
+              />
+              <button
+                className="send-button"
+                disabled={isSubmitting || promptText.trim().length === 0}
+                type="submit"
+                aria-label="发送文本问题"
+              >
+                <span className="icon-send" aria-hidden="true" />
+                <span>{isSubmitting ? "发送中" : "发送"}</span>
+              </button>
+            </form>
+
             <div className="control-buttons">
               <button
                 className="round-button ghost-button"
@@ -333,13 +497,13 @@ export function App() {
                 <span className="icon-camera" aria-hidden="true" />
               </button>
               <button
-                className="round-button mic-button"
+                className="round-button camera-button"
                 type="button"
-                aria-label={sessionStatus === "starting" ? "启动中" : "开始会话"}
+                aria-label={sessionStatus === "starting" ? "启动中" : "开始摄像头"}
                 disabled={sessionStatus === "starting"}
                 onClick={startSession}
               >
-                <span className="icon-mic" aria-hidden="true" />
+                <span className="icon-video" aria-hidden="true" />
               </button>
               <button
                 className="round-button ghost-button danger-button"
@@ -358,7 +522,7 @@ export function App() {
               </div>
               <div>
                 <dt>Frames:</dt>
-                <dd>{keyframes.length}</dd>
+                <dd>{frameCountLabel}</dd>
               </div>
               <div>
                 <dt>Cost:</dt>
