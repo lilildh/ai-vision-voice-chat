@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  postSpeechTranscription,
   postConversationTurn,
   streamConversationTurn
 } from "./conversation-client";
@@ -68,6 +69,37 @@ describe("postConversationTurn", () => {
     expect(response).toEqual({
       ok: true,
       reply: { role: "assistant", text: "我看到一张桌面画面。" }
+    });
+  });
+});
+
+describe("postSpeechTranscription", () => {
+  it("posts recorded browser audio as multipart form data", async () => {
+    const audio = new Blob(["fake-webm-audio"], { type: "audio/webm" });
+    const fetchFn = vi.fn().mockResolvedValue({
+      json: async () => ({
+        ok: true,
+        text: "你看到了什么？"
+      }),
+      ok: true
+    });
+
+    const response = await postSpeechTranscription(
+      audio,
+      { sessionId: "session-1" },
+      fetchFn
+    );
+
+    expect(fetchFn).toHaveBeenCalledWith("/api/speech-transcription", {
+      body: expect.any(FormData),
+      method: "POST"
+    });
+    const formData = fetchFn.mock.calls[0]?.[1]?.body as FormData;
+
+    expect(formData.get("sessionId")).toBe("session-1");
+    expect(response).toEqual({
+      ok: true,
+      text: "你看到了什么？"
     });
   });
 });

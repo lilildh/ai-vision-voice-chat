@@ -6,6 +6,7 @@ import {
   waitFor,
   within
 } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -43,6 +44,30 @@ type MockConversationResponse =
       timing: { totalMs: number };
     };
 
+type MockSpeechTranscriptionResponse =
+  | {
+      ok: true;
+      text: string;
+      model: {
+        name: string;
+        provider: "openai-compatible";
+      };
+      timing: {
+        modelMs: number;
+        totalMs: number;
+      };
+    }
+  | {
+      ok: false;
+      error: {
+        code: string;
+        details?: Record<string, unknown>;
+        message: string;
+        retryable: boolean;
+      };
+      timing: { totalMs: number };
+    };
+
 const successResponse: MockConversationResponse = {
   cost: {
     request: {
@@ -64,59 +89,18 @@ const successResponse: MockConversationResponse = {
   }
 };
 
-type MockRecognitionResultInput = {
-  isFinal: boolean;
-  transcript: string;
+const successSpeechTranscription: MockSpeechTranscriptionResponse = {
+  model: {
+    name: "asr-model",
+    provider: "openai-compatible"
+  },
+  ok: true,
+  text: "你看到了什么？",
+  timing: {
+    modelMs: 123,
+    totalMs: 180
+  }
 };
-
-class MockSpeechRecognition {
-  static instances: MockSpeechRecognition[] = [];
-
-  continuous = true;
-  interimResults = false;
-  lang = "";
-  maxAlternatives = 0;
-  onend: ((event: Event) => void) | null = null;
-  onerror: ((event: { error: string }) => void) | null = null;
-  onresult: ((event: {
-    resultIndex: number;
-    results: Array<{
-      0: { confidence: number; transcript: string };
-      isFinal: boolean;
-      length: number;
-    }>;
-  }) => void) | null = null;
-  onstart: ((event: Event) => void) | null = null;
-  start = vi.fn(() => {
-    this.onstart?.(new Event("start"));
-  });
-  stop = vi.fn(() => {
-    this.onend?.(new Event("end"));
-  });
-  abort = vi.fn();
-
-  constructor() {
-    MockSpeechRecognition.instances.push(this);
-  }
-
-  emitResult(results: MockRecognitionResultInput[]) {
-    this.onresult?.({
-      resultIndex: 0,
-      results: results.map((result) => ({
-        0: {
-          confidence: 0.92,
-          transcript: result.transcript
-        },
-        isFinal: result.isFinal,
-        length: 1
-      }))
-    });
-  }
-
-  emitError(error: string) {
-    this.onerror?.({ error });
-  }
-}
 
 class MockSpeechSynthesisUtterance {
   static instances: MockSpeechSynthesisUtterance[] = [];
@@ -131,6 +115,67 @@ class MockSpeechSynthesisUtterance {
   constructor(text = "") {
     this.text = text;
     MockSpeechSynthesisUtterance.instances.push(this);
+  }
+}
+
+let mockAudioLevels: number[] = [];
+
+class MockAnalyserNode {
+  fftSize = 32;
+  frequencyBinCount = 16;
+
+  getByteTimeDomainData(array: Uint8Array) {
+    const level = mockAudioLevels.length > 0 ? mockAudioLevels.shift() ?? 0 : 0;
+
+    array.fill(Math.min(255, 128 + level));
+  }
+}
+
+class MockAudioContext {
+  static instances: MockAudioContext[] = [];
+
+  analyser = new MockAnalyserNode();
+  close = vi.fn().mockResolvedValue(undefined);
+  createAnalyser = vi.fn(() => this.analyser);
+  createMediaStreamSource = vi.fn(() => ({
+    connect: vi.fn(),
+    disconnect: vi.fn()
+  }));
+
+  constructor() {
+    MockAudioContext.instances.push(this);
+  }
+}
+
+class MockMediaRecorder {
+  static instances: MockMediaRecorder[] = [];
+  static isTypeSupported = vi.fn(() => true);
+
+  mimeType = "audio/webm";
+  ondataavailable: ((event: { data: Blob }) => void) | null = null;
+  onstop: ((event: Event) => void) | null = null;
+  onstart: ((event: Event) => void) | null = null;
+  state: "inactive" | "paused" | "recording" = "inactive";
+  start = vi.fn(() => {
+    this.state = "recording";
+    this.onstart?.(new Event("start"));
+  });
+  stop = vi.fn(() => {
+    this.state = "inactive";
+    this.onstop?.(new Event("stop"));
+  });
+
+  constructor(
+    readonly stream: MediaStream,
+    readonly options?: MediaRecorderOptions
+  ) {
+    MockMediaRecorder.instances.push(this);
+  }
+
+  emitData(content = "fake-webm-audio") {
+    this.ondataavailable?.({
+      data: new Blob([content], { type: this.mimeType })
+    });
   }
 }
 
@@ -159,6 +204,7 @@ function mockApi(
   options: {
     modelConfigPutOk?: boolean;
     modelConfigPutResponse?: unknown;
+    speechTranscriptionResponse?: MockSpeechTranscriptionResponse;
     streamDeltas?: string[];
   } = {}
 ) {
@@ -184,6 +230,7 @@ function mockApi(
             ok: options.modelConfigPutOk ?? true,
             json: async () =>
               options.modelConfigPutResponse ?? {
+                asrModelName: "runtime-asr-model",
                 baseUrl: "https://runtime-model.example.test/v1",
                 hasApiKey: true,
                 maxOutputTokens: 640,
@@ -203,6 +250,16 @@ function mockApi(
             ok: true,
             source: "missing"
           })
+        };
+      }
+
+      if (requestUrl === "/api/speech-transcription") {
+        const responseBody =
+          options.speechTranscriptionResponse ?? successSpeechTranscription;
+
+        return {
+          ok: responseBody.ok,
+          json: async () => responseBody
         };
       }
 
@@ -237,10 +294,26 @@ function mockApi(
 
 function mockMediaSession() {
   const stop = vi.fn();
-  const mediaStream = {
-    getTracks: () => [{ stop }]
-  } as unknown as MediaStream;
+  const audioTrack = { kind: "audio", stop } as unknown as MediaStreamTrack;
+  const videoTrack = { kind: "video", stop } as unknown as MediaStreamTrack;
+  class MockMediaStream {
+    constructor(private readonly tracks: MediaStreamTrack[] = []) {}
+
+    getAudioTracks() {
+      return this.tracks.filter((track) => track.kind === "audio");
+    }
+
+    getTracks() {
+      return this.tracks;
+    }
+  }
+  const mediaStream = new MockMediaStream([
+    audioTrack,
+    videoTrack
+  ]) as unknown as MediaStream;
   const getUserMedia = vi.fn().mockResolvedValue(mediaStream);
+
+  vi.stubGlobal("MediaStream", MockMediaStream);
 
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
@@ -248,18 +321,29 @@ function mockMediaSession() {
   });
 
   return {
+    audioTrack,
     getUserMedia,
     mediaStream,
     stop
   };
 }
 
-function mockSpeechRecognition() {
-  MockSpeechRecognition.instances = [];
-  vi.stubGlobal("SpeechRecognition", MockSpeechRecognition);
-  vi.stubGlobal("webkitSpeechRecognition", MockSpeechRecognition);
+function mockCloudSpeechInput(
+  levels: number[] = [40, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+) {
+  MockMediaRecorder.instances = [];
+  MockMediaRecorder.isTypeSupported.mockReturnValue(true);
+  MockAudioContext.instances = [];
+  mockAudioLevels = [...levels];
 
-  return MockSpeechRecognition;
+  vi.stubGlobal("MediaRecorder", MockMediaRecorder);
+  vi.stubGlobal("AudioContext", MockAudioContext);
+  vi.stubGlobal("webkitAudioContext", MockAudioContext);
+
+  return {
+    AudioContext: MockAudioContext,
+    MediaRecorder: MockMediaRecorder
+  };
 }
 
 function mockSpeechSynthesis() {
@@ -338,28 +422,40 @@ function mockFrameBufferInterval() {
   const originalSetInterval = window.setInterval.bind(window);
   const originalClearInterval = window.clearInterval.bind(window);
   const intervalId = 113 as unknown as ReturnType<typeof window.setInterval>;
+  const audioIntervalId = 114 as unknown as ReturnType<typeof window.setInterval>;
   const callbacks: Array<() => void> = [];
+  const audioCallbacks: Array<() => void> = [];
   const setIntervalMock = ((
     handler: TimerHandler,
     timeout?: number,
     ...args: unknown[]
   ) => {
-    if (timeout !== defaultFrameBufferOptions.sampleIntervalMs) {
-      return originalSetInterval(handler, timeout, ...args);
+    if (timeout === defaultFrameBufferOptions.sampleIntervalMs) {
+      callbacks.push(() => {
+        if (typeof handler === "function") {
+          handler();
+        }
+      });
+
+      return intervalId;
     }
 
-    callbacks.push(() => {
-      if (typeof handler === "function") {
-        handler();
-      }
-    });
+    if (timeout === audioMonitorIntervalMs) {
+      audioCallbacks.push(() => {
+        if (typeof handler === "function") {
+          handler();
+        }
+      });
 
-    return intervalId;
+      return audioIntervalId;
+    }
+
+    return originalSetInterval(handler, timeout, ...args);
   }) as typeof window.setInterval;
   const clearIntervalMock = ((
     handle?: Parameters<typeof window.clearInterval>[0]
   ) => {
-    if (handle === intervalId) {
+    if (handle === intervalId || handle === audioIntervalId) {
       return undefined;
     }
 
@@ -373,6 +469,8 @@ function mockFrameBufferInterval() {
     .mockImplementation(clearIntervalMock);
 
   return {
+    audioCallbacks,
+    audioIntervalId,
     callbacks,
     clearIntervalSpy,
     intervalId,
@@ -424,12 +522,30 @@ function getModelConfigPutBody(fetchMock: ReturnType<typeof vi.fn>) {
   expect(call).toBeDefined();
 
   return JSON.parse(call?.[1]?.body as string) as {
+    asrModelName?: string;
     apiKey: string;
     baseUrl: string;
     maxOutputTokens: number;
     modelName: string;
     timeoutMs: number;
   };
+}
+
+const voiceTurnSilenceMs = 1800;
+const audioMonitorIntervalMs = 200;
+
+function finishCloudSpeechSegment(audioCallbacks: Array<() => void>) {
+  act(() => {
+    audioCallbacks[0]?.();
+
+    for (
+      let elapsed = 0;
+      elapsed < voiceTurnSilenceMs;
+      elapsed += audioMonitorIntervalMs
+    ) {
+      audioCallbacks[0]?.();
+    }
+  });
 }
 
 describe("App", () => {
@@ -439,6 +555,7 @@ describe("App", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -459,8 +576,8 @@ describe("App", () => {
       screen.getByRole("button", { name: "发送文本问题" })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "截取关键帧" })
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "截取关键帧" })
+    ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "开始对话" })
     ).toBeInTheDocument();
@@ -473,7 +590,7 @@ describe("App", () => {
     expect(
       screen.queryByRole("button", { name: "开始语音监听" })
     ).not.toBeInTheDocument();
-    expect(screen.getByText("Buffer:")).toBeInTheDocument();
+    expect(screen.getByText("视觉:")).toBeInTheDocument();
     expect(screen.getByText("0 / 3")).toBeInTheDocument();
     expect(screen.getByText("等待语音输入")).toBeInTheDocument();
     expect(screen.getByText("等待播报")).toBeInTheDocument();
@@ -484,6 +601,17 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByText("后端在线")).toBeInTheDocument();
     });
+  });
+
+  it("keeps the initial speech state idle under React StrictMode", () => {
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>
+    );
+
+    expect(screen.getByText("等待语音输入")).toBeInTheDocument();
+    expect(screen.queryByText("语音暂停")).not.toBeInTheDocument();
   });
 
   it("uses a local camera feed reference asset", () => {
@@ -510,6 +638,9 @@ describe("App", () => {
     fireEvent.change(within(dialog).getByLabelText("模型名称"), {
       target: { value: "runtime-vision-model" }
     });
+    fireEvent.change(within(dialog).getByLabelText("ASR 模型名称"), {
+      target: { value: "runtime-asr-model" }
+    });
     fireEvent.change(within(dialog).getByLabelText("API Key"), {
       target: { value: "runtime-secret" }
     });
@@ -527,6 +658,7 @@ describe("App", () => {
 
     expect(getModelConfigPutBody(fetchMock)).toEqual({
       apiKey: "runtime-secret",
+      asrModelName: "runtime-asr-model",
       baseUrl: "https://runtime-model.example.test/v1",
       maxOutputTokens: 640,
       modelName: "runtime-vision-model",
@@ -561,6 +693,9 @@ describe("App", () => {
     fireEvent.change(within(dialog).getByLabelText("模型名称"), {
       target: { value: "runtime-vision-model" }
     });
+    fireEvent.change(within(dialog).getByLabelText("ASR 模型名称"), {
+      target: { value: "runtime-asr-model" }
+    });
     fireEvent.change(within(dialog).getByLabelText("API Key"), {
       target: { value: "runtime-secret" }
     });
@@ -590,6 +725,9 @@ describe("App", () => {
     });
     fireEvent.change(within(dialog).getByLabelText("模型名称"), {
       target: { value: "runtime-vision-model" }
+    });
+    fireEvent.change(within(dialog).getByLabelText("ASR 模型名称"), {
+      target: { value: "runtime-asr-model" }
     });
     fireEvent.change(within(dialog).getByLabelText("API Key"), {
       target: { value: "runtime-secret" }
@@ -622,9 +760,9 @@ describe("App", () => {
     toDataUrl.mockRestore();
   });
 
-  it("starts the camera and Web Speech listening from one conversation control", async () => {
-    const Recognition = mockSpeechRecognition();
-    const { getUserMedia } = mockMediaSession();
+  it("starts the camera, microphone, and cloud ASR recorder from one conversation control", async () => {
+    mockCloudSpeechInput();
+    const { audioTrack, getUserMedia, mediaStream } = mockMediaSession();
 
     render(<App />);
 
@@ -632,7 +770,7 @@ describe("App", () => {
 
     await waitFor(() => {
       expect(getUserMedia).toHaveBeenCalledWith({
-        audio: false,
+        audio: true,
         video: true
       });
       expect(screen.getByText("实时画面")).toBeInTheDocument();
@@ -640,13 +778,16 @@ describe("App", () => {
       expect(screen.getByText("正在监听")).toBeInTheDocument();
     });
 
-    const recognition = Recognition.instances[0];
+    const recorder = MockMediaRecorder.instances[0];
 
-    expect(recognition).toBeDefined();
-    expect(recognition.start).toHaveBeenCalledTimes(1);
-    expect(recognition.lang).toBe("zh-CN");
-    expect(recognition.interimResults).toBe(true);
-    expect(recognition.continuous).toBe(false);
+    expect(recorder).toBeDefined();
+    expect(recorder.stream).not.toBe(mediaStream);
+    expect(recorder.stream.getTracks()).toEqual([audioTrack]);
+    expect(recorder.start).toHaveBeenCalledWith(250);
+    expect(MockAudioContext.instances).toHaveLength(1);
+    expect(MockAudioContext.instances[0].createMediaStreamSource).toHaveBeenCalledWith(
+      recorder.stream
+    );
   });
 
   it("starts automatic frame buffering after the session starts and clears it on end", async () => {
@@ -679,12 +820,9 @@ describe("App", () => {
     await waitFor(() => {
       expect(drawImage).toHaveBeenCalledWith(video, 0, 0, 320, 180);
       expect(toDataUrl).toHaveBeenCalledWith("image/jpeg", 0.62);
-      expect(screen.getByAltText("关键帧 1")).toHaveAttribute(
-        "src",
-        "data:image/jpeg;base64,YXV0bw=="
-      );
       expect(screen.getByText("1 / 3")).toBeInTheDocument();
     });
+    expect(screen.queryByAltText("关键帧 1")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "结束对话" }));
 
@@ -695,7 +833,7 @@ describe("App", () => {
   });
 
   it("pauses and resumes listening from the same conversation control", async () => {
-    const Recognition = mockSpeechRecognition();
+    mockCloudSpeechInput();
     mockMediaSession();
 
     render(<App />);
@@ -706,24 +844,24 @@ describe("App", () => {
       expect(screen.getByText("正在监听")).toBeInTheDocument();
     });
 
-    const firstRecognition = Recognition.instances[0];
+    const firstRecorder = MockMediaRecorder.instances[0];
 
     fireEvent.click(screen.getByRole("button", { name: "暂停监听" }));
 
-    expect(firstRecognition.abort).toHaveBeenCalledTimes(1);
+    expect(firstRecorder.stop).toHaveBeenCalledTimes(1);
     expect(screen.getByText("语音暂停")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "继续监听" }));
 
     await waitFor(() => {
-      expect(Recognition.instances).toHaveLength(2);
-      expect(Recognition.instances[1].start).toHaveBeenCalledTimes(1);
+      expect(MockMediaRecorder.instances).toHaveLength(2);
+      expect(MockMediaRecorder.instances[1].start).toHaveBeenCalledTimes(1);
       expect(screen.getByText("正在监听")).toBeInTheDocument();
     });
   });
 
   it("ends the whole conversation only from the red close control", async () => {
-    const Recognition = mockSpeechRecognition();
+    mockCloudSpeechInput();
     const speechSynthesisMock = mockSpeechSynthesis();
     const { stop } = mockMediaSession();
 
@@ -732,12 +870,12 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
     await screen.findByLabelText("实时摄像头预览");
 
-    const recognition = Recognition.instances[0];
+    const recorder = MockMediaRecorder.instances[0];
 
     fireEvent.click(screen.getByRole("button", { name: "结束对话" }));
 
-    expect(stop).toHaveBeenCalledTimes(1);
-    expect(recognition.abort).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(recorder.stop).toHaveBeenCalledTimes(1);
     expect(speechSynthesisMock.cancel).toHaveBeenCalled();
     expect(screen.getByText("会话尚未开始")).toBeInTheDocument();
     expect(
@@ -748,8 +886,10 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows interim transcription while Web Speech recognition is producing partial text", async () => {
-    const Recognition = mockSpeechRecognition();
+  it("shows transcribing status while cloud ASR is collecting a voice segment", async () => {
+    const fetchMock = mockApi();
+    mockCloudSpeechInput([40, 40]);
+    const { audioCallbacks } = mockFrameBufferInterval();
     mockMediaSession();
 
     render(<App />);
@@ -757,22 +897,24 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
     await screen.findByLabelText("实时摄像头预览");
 
-    Recognition.instances[0].emitResult([
-      {
-        isFinal: false,
-        transcript: "你看到"
-      }
-    ]);
+    MockMediaRecorder.instances[0].emitData();
+
+    act(() => {
+      audioCallbacks[0]?.();
+    });
 
     await waitFor(() => {
       expect(screen.getByText("转写中")).toBeInTheDocument();
-      expect(screen.getByText("你看到")).toBeInTheDocument();
     });
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/speech-transcription")
+    ).toBe(false);
   });
 
-  it("auto-submits final speech transcription, speaks the reply, and resumes listening after TTS ends", async () => {
+  it("waits for silence before submitting final speech transcription, speaks the reply, and resumes listening after TTS ends", async () => {
     const fetchMock = mockApi();
-    const Recognition = mockSpeechRecognition();
+    mockCloudSpeechInput([40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const { audioCallbacks } = mockFrameBufferInterval();
     const speechSynthesisMock = mockSpeechSynthesis();
     mockMediaSession();
     const { getContext, toDataUrl } = mockCanvas();
@@ -782,12 +924,21 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
     await screen.findByLabelText("实时摄像头预览");
 
-    Recognition.instances[0].emitResult([
-      {
-        isFinal: true,
-        transcript: "你看到了什么？"
-      }
-    ]);
+    MockMediaRecorder.instances[0].emitData();
+
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn/stream")
+    ).toBe(false);
+
+    act(() => {
+      audioCallbacks[0]?.();
+    });
+
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn/stream")
+    ).toBe(false);
+
+    finishCloudSpeechSegment(audioCallbacks);
 
     await waitFor(() => {
       expect(screen.getByText("我看到一张桌面画面。")).toBeInTheDocument();
@@ -808,8 +959,8 @@ describe("App", () => {
     MockSpeechSynthesisUtterance.instances[0].onend?.(new Event("end"));
 
     await waitFor(() => {
-      expect(Recognition.instances).toHaveLength(2);
-      expect(Recognition.instances[1].start).toHaveBeenCalledTimes(1);
+      expect(MockMediaRecorder.instances).toHaveLength(2);
+      expect(MockMediaRecorder.instances[1].start).toHaveBeenCalledTimes(1);
       expect(screen.getByText("正在监听")).toBeInTheDocument();
     });
 
@@ -817,10 +968,46 @@ describe("App", () => {
     toDataUrl.mockRestore();
   });
 
-  it("submits cached low-resolution frames when final speech transcription arrives", async () => {
+  it("uploads recorded audio to cloud ASR before submitting the visual turn", async () => {
     const fetchMock = mockApi();
-    const Recognition = mockSpeechRecognition();
-    const { callbacks } = mockFrameBufferInterval();
+    mockCloudSpeechInput([40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const { audioCallbacks } = mockFrameBufferInterval();
+    mockMediaSession();
+    const { getContext, toDataUrl } = mockCanvas();
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
+    await screen.findByLabelText("实时摄像头预览");
+
+    MockMediaRecorder.instances[0].emitData("cloud-audio");
+
+    finishCloudSpeechSegment(audioCallbacks);
+
+    await waitFor(() => {
+      expect(screen.getByText("我看到一张桌面画面。")).toBeInTheDocument();
+    });
+
+    const bodies = getConversationRequestBodies(fetchMock);
+    const speechCall = fetchMock.mock.calls.find(
+      ([url]) => url === "/api/speech-transcription"
+    );
+
+    expect(speechCall?.[1]?.body).toBeInstanceOf(FormData);
+    expect((speechCall?.[1]?.body as FormData).get("sessionId")).toBe(
+      bodies[0].session.sessionId
+    );
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].text).toBe("你看到了什么？");
+
+    getContext.mockRestore();
+    toDataUrl.mockRestore();
+  });
+
+  it("submits cached low-resolution frames after speech silence without showing frame thumbnails", async () => {
+    const fetchMock = mockApi();
+    mockCloudSpeechInput([40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const { audioCallbacks, callbacks } = mockFrameBufferInterval();
     mockMediaSession();
     const { getContext, toDataUrl } = mockCanvas(
       "data:image/jpeg;base64,Y2FjaGVk",
@@ -841,15 +1028,13 @@ describe("App", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByAltText("关键帧 1")).toBeInTheDocument();
+      expect(screen.getByText("1 / 3")).toBeInTheDocument();
     });
+    expect(screen.queryByAltText("关键帧 1")).not.toBeInTheDocument();
 
-    Recognition.instances[0].emitResult([
-      {
-        isFinal: true,
-        transcript: "请看最近的画面。"
-      }
-    ]);
+    MockMediaRecorder.instances[0].emitData();
+
+    finishCloudSpeechSegment(audioCallbacks);
 
     await waitFor(() => {
       expect(screen.getByText("我看到一张桌面画面。")).toBeInTheDocument();
@@ -857,7 +1042,7 @@ describe("App", () => {
 
     const body = getConversationRequestBody(fetchMock);
 
-    expect(body.text).toBe("请看最近的画面。");
+    expect(body.text).toBe("你看到了什么？");
     expect(body.keyframes).toEqual([
       expect.objectContaining({
         dataUrl: "data:image/jpeg;base64,Y2FjaGVk",
@@ -997,7 +1182,8 @@ describe("App", () => {
   });
 
   it("stops current browser speech synthesis and shows stopped status", async () => {
-    const Recognition = mockSpeechRecognition();
+    mockCloudSpeechInput([40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const { audioCallbacks } = mockFrameBufferInterval();
     const speechSynthesisMock = mockSpeechSynthesis();
     mockMediaSession();
     const { getContext, toDataUrl } = mockCanvas();
@@ -1007,12 +1193,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
     await screen.findByLabelText("实时摄像头预览");
 
-    Recognition.instances[0].emitResult([
-      {
-        isFinal: true,
-        transcript: "请说明画面。"
-      }
-    ]);
+    MockMediaRecorder.instances[0].emitData();
+
+    finishCloudSpeechSegment(audioCallbacks);
 
     await screen.findByText("正在播报");
 
@@ -1025,8 +1208,24 @@ describe("App", () => {
     toDataUrl.mockRestore();
   });
 
-  it("shows a clear unsupported message when Web Speech recognition is unavailable", async () => {
-    const fetchMock = mockApi();
+  it("does not submit a visual turn when cloud ASR fails", async () => {
+    const fetchMock = mockApi(successResponse, {
+      speechTranscriptionResponse: {
+        error: {
+          code: "MODEL_PROVIDER_ERROR",
+          details: {
+            providerStatus: 404,
+            providerText: "model not found"
+          },
+          message: "ASR 模型名、接口路径或请求格式不兼容。",
+          retryable: true
+        },
+        ok: false,
+        timing: { totalMs: 42 }
+      }
+    });
+    mockCloudSpeechInput([40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const { audioCallbacks } = mockFrameBufferInterval();
     mockMediaSession();
 
     render(<App />);
@@ -1034,24 +1233,92 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
     await screen.findByLabelText("实时摄像头预览");
 
-    expect(
-      screen.getByText("当前浏览器不支持语音识别，请使用 Chrome 或继续手动输入。")
-    ).toBeInTheDocument();
-    expect(screen.getByText("不支持语音识别")).toBeInTheDocument();
+    MockMediaRecorder.instances[0].emitData();
+
+    finishCloudSpeechSegment(audioCallbacks);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          "MODEL_PROVIDER_ERROR：ASR 模型名、接口路径或请求格式不兼容。（provider 404）请检查 Base URL、API Key、ASR 模型名称是否支持 OpenAI-compatible audio/transcriptions。provider 返回：model not found"
+        )
+      ).toBeInTheDocument();
+    });
     expect(
       fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn/stream")
     ).toBe(false);
   });
 
-  it("shows a clear error when capturing before media is active", () => {
+  it("does not submit a visual turn when cloud ASR returns empty text", async () => {
+    const fetchMock = mockApi(successResponse, {
+      speechTranscriptionResponse: {
+        error: {
+          code: "EMPTY_TRANSCRIPTION",
+          message: "云端语音识别没有返回可用文本，请再说一次。",
+          retryable: true
+        },
+        ok: false,
+        timing: { totalMs: 42 }
+      }
+    });
+    mockCloudSpeechInput([40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const { audioCallbacks } = mockFrameBufferInterval();
+    mockMediaSession();
+
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "截取关键帧" }));
+    fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
+    await screen.findByLabelText("实时摄像头预览");
 
-    expect(screen.getByText("请先启动摄像头，再截取关键帧。")).toBeInTheDocument();
+    MockMediaRecorder.instances[0].emitData();
+
+    finishCloudSpeechSegment(audioCallbacks);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("EMPTY_TRANSCRIPTION：云端语音识别没有返回可用文本，请再说一次。")
+      ).toBeInTheDocument();
+    });
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn/stream")
+    ).toBe(false);
   });
 
-  it("captures a buffered low-resolution JPEG frame from the active video element", async () => {
+  it("shows a clear unsupported message when cloud audio recording is unavailable", async () => {
+    const fetchMock = mockApi();
+    mockMediaSession();
+
+    vi.stubGlobal("MediaRecorder", undefined);
+    vi.stubGlobal("AudioContext", undefined);
+    vi.stubGlobal("webkitAudioContext", undefined);
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
+    await screen.findByLabelText("实时摄像头预览");
+
+    expect(
+      screen.getByText("当前浏览器不支持云端语音录制，请使用文本输入。")
+    ).toBeInTheDocument();
+    expect(screen.getByText("不支持语音识别")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/speech-transcription")
+    ).toBe(false);
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn/stream")
+    ).toBe(false);
+  });
+
+  it("does not expose manual frame capture controls", () => {
+    render(<App />);
+
+    expect(
+      screen.queryByRole("button", { name: "截取关键帧" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("captures a hidden buffered low-resolution JPEG frame from the active video element", async () => {
+    const { callbacks } = mockFrameBufferInterval();
     mockMediaSession();
     const { drawImage, getContext, toDataUrl } = mockCanvas();
 
@@ -1061,23 +1328,27 @@ describe("App", () => {
 
     const video = await screen.findByLabelText("实时摄像头预览");
 
-    fireEvent.click(screen.getByRole("button", { name: "截取关键帧" }));
+    await waitFor(() => {
+      expect(callbacks).toHaveLength(1);
+    });
+
+    act(() => {
+      callbacks[0]?.();
+    });
 
     await waitFor(() => {
       expect(drawImage).toHaveBeenCalledWith(video, 0, 0, 320, 180);
       expect(toDataUrl).toHaveBeenCalledWith("image/jpeg", 0.62);
-      expect(screen.getByAltText("关键帧 1")).toHaveAttribute(
-        "src",
-        "data:image/jpeg;base64,aW1hZ2U="
-      );
       expect(screen.getByText("1 / 3")).toBeInTheDocument();
     });
+    expect(screen.queryByAltText("关键帧 1")).not.toBeInTheDocument();
 
     getContext.mockRestore();
     toDataUrl.mockRestore();
   });
 
-  it("keeps the keyframe preview capped at the latest three buffered frames", async () => {
+  it("keeps the hidden keyframe buffer capped at the latest three frames", async () => {
+    const { callbacks } = mockFrameBufferInterval();
     mockMediaSession();
     const { getContext, toDataUrl } = mockCanvas(
       [
@@ -1100,23 +1371,26 @@ describe("App", () => {
 
     await screen.findByLabelText("实时摄像头预览");
 
-    const captureButton = screen.getByRole("button", { name: "截取关键帧" });
-
-    fireEvent.click(captureButton);
-    fireEvent.click(captureButton);
-    fireEvent.click(captureButton);
-
     await waitFor(() => {
-      expect(screen.getByAltText("关键帧 3")).toBeInTheDocument();
+      expect(callbacks).toHaveLength(1);
     });
 
-    fireEvent.click(captureButton);
+    act(() => {
+      callbacks[0]?.();
+      callbacks[0]?.();
+      callbacks[0]?.();
+    });
 
+    await waitFor(() => {
+      expect(screen.getByText("3 / 3")).toBeInTheDocument();
+    });
+
+    act(() => {
+      callbacks[0]?.();
+    });
+
+    expect(screen.queryByAltText("关键帧 1")).not.toBeInTheDocument();
     expect(screen.queryByAltText("关键帧 4")).not.toBeInTheDocument();
-    expect(screen.getByAltText("关键帧 1")).toHaveAttribute(
-      "src",
-      "data:image/jpeg;base64,c2Vjb25k"
-    );
     expect(screen.getByText("3 / 3")).toBeInTheDocument();
 
     getContext.mockRestore();
@@ -1153,11 +1427,11 @@ describe("App", () => {
     });
     expect(body.session.sessionId).toEqual(expect.any(String));
     expect(body.session.messages).toEqual([]);
-    expect(screen.getByText("Buffer:")).toBeInTheDocument();
+    expect(screen.getByText("视觉:")).toBeInTheDocument();
     expect(screen.getByText("0 / 3")).toBeInTheDocument();
-    expect(screen.getByText("Cost:")).toBeInTheDocument();
+    expect(screen.getByText("成本:")).toBeInTheDocument();
     expect(screen.getByText("$0.000420")).toBeInTheDocument();
-    expect(screen.getByText("Lat:")).toBeInTheDocument();
+    expect(screen.getByText("延迟:")).toBeInTheDocument();
     expect(screen.getByText("321ms")).toBeInTheDocument();
     expect(toDataUrl).toHaveBeenCalledTimes(1);
 
@@ -1165,22 +1439,30 @@ describe("App", () => {
     toDataUrl.mockRestore();
   });
 
-  it("submits existing keyframes without auto-capturing extra frames", async () => {
+  it("submits existing hidden buffered keyframes without auto-capturing extra frames", async () => {
     const fetchMock = mockApi();
+    const { callbacks } = mockFrameBufferInterval();
     mockMediaSession();
-    const { getContext, toDataUrl } = mockCanvas();
+    const { getContext, toDataUrl } = mockCanvas(
+      ["data:image/jpeg;base64,Zmlyc3Q=", "data:image/jpeg;base64,c2Vjb25k"],
+      [
+        [24, 24, 24, 24],
+        [80, 80, 80, 80]
+      ]
+    );
 
     render(<App />);
 
     fireEvent.click(screen.getByRole("button", { name: "开始对话" }));
     await screen.findByLabelText("实时摄像头预览");
 
-    const captureButton = screen.getByRole("button", { name: "截取关键帧" });
-    fireEvent.click(captureButton);
-    fireEvent.click(captureButton);
-
     await waitFor(() => {
-      expect(screen.getByAltText("关键帧 2")).toBeInTheDocument();
+      expect(callbacks).toHaveLength(1);
+    });
+
+    act(() => {
+      callbacks[0]?.();
+      callbacks[0]?.();
     });
 
     fireEvent.change(screen.getByRole("textbox", { name: "文本问题" }), {
@@ -1196,6 +1478,7 @@ describe("App", () => {
 
     expect(body.keyframes).toHaveLength(2);
     expect(toDataUrl).toHaveBeenCalledTimes(2);
+    expect(screen.queryByAltText("关键帧 1")).not.toBeInTheDocument();
 
     getContext.mockRestore();
     toDataUrl.mockRestore();
@@ -1286,7 +1569,7 @@ describe("App", () => {
     expect(screen.getByRole("textbox", { name: "文本问题" })).toHaveValue(
       "这是什么？"
     );
-    expect(screen.getByAltText("关键帧 1")).toBeInTheDocument();
+    expect(screen.queryByAltText("关键帧 1")).not.toBeInTheDocument();
 
     getContext.mockRestore();
     toDataUrl.mockRestore();

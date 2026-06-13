@@ -754,50 +754,6 @@ button {
   padding-left: 46px;
 }
 
-.keyframe-strip {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.keyframe-card {
-  width: 76px;
-  min-height: 64px;
-  margin: 0;
-  overflow: hidden;
-  border: 1px solid rgb(70 69 86 / 44%);
-  border-radius: 6px;
-  background:
-    linear-gradient(135deg, rgb(193 193 255 / 8%), rgb(0 220 229 / 9%)),
-    repeating-linear-gradient(90deg, #14171b 0 8px, #1f2228 8px 16px);
-}
-
-.keyframe-card img {
-  display: block;
-  width: 100%;
-  height: 48px;
-  object-fit: cover;
-}
-
-.keyframe-card figcaption {
-  overflow: hidden;
-  padding: 4px 5px;
-  color: rgb(199 196 216 / 72%);
-  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.6rem;
-  line-height: 1.1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.empty-keyframes {
-  color: rgb(199 196 216 / 70%);
-  font-size: 0.76rem;
-  font-weight: 800;
-}
-
 .listening-indicator {
   display: flex;
   align-items: center;
@@ -956,22 +912,23 @@ button {
 .prompt-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  margin-bottom: 18px;
+  gap: 10px;
+  margin-bottom: 14px;
+  opacity: 0.82;
 }
 
 .prompt-textarea {
   width: 100%;
-  min-height: 72px;
+  min-height: 56px;
   resize: none;
-  border: 1px solid rgb(70 69 86 / 48%);
+  border: 1px solid rgb(70 69 86 / 34%);
   border-radius: 8px;
   outline: none;
-  background: rgb(17 19 22 / 62%);
+  background: rgb(17 19 22 / 40%);
   color: #e2e2e6;
-  padding: 11px 12px;
+  padding: 10px 12px;
   font: inherit;
-  font-size: 0.9rem;
+  font-size: 0.84rem;
   line-height: 1.45;
 }
 
@@ -987,17 +944,17 @@ button {
 
 .send-button {
   display: inline-flex;
-  min-width: 88px;
+  min-width: 78px;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  border: 1px solid transparent;
+  border: 1px solid rgb(0 220 229 / 22%);
   border-radius: 8px;
-  background: #00a3ad;
-  color: #f4feff;
+  background: rgb(0 163 173 / 20%);
+  color: #c9fbff;
   cursor: pointer;
-  padding: 0 14px;
-  font-size: 0.86rem;
+  padding: 0 12px;
+  font-size: 0.8rem;
   font-weight: 900;
   transition:
     background 160ms ease,
@@ -1006,8 +963,8 @@ button {
 }
 
 .send-button:hover:not(:disabled) {
-  background: #00bac5;
-  box-shadow: 0 0 22px rgb(0 220 229 / 28%);
+  background: rgb(0 186 197 / 30%);
+  box-shadow: 0 0 18px rgb(0 220 229 / 18%);
   transform: translateY(-1px);
 }
 
@@ -1030,7 +987,7 @@ button {
   box-shadow:
     0 18px 42px rgb(0 0 0 / 32%),
     inset 0 1px 0 rgb(255 255 255 / 8%);
-  gap: 22px;
+  gap: 18px;
   padding: 12px 18px;
   backdrop-filter: blur(18px);
 }
@@ -1057,20 +1014,12 @@ button {
   transform: none;
 }
 
-.utility-button,
 .end-call-button {
   width: 58px;
   height: 58px;
   border-color: rgb(245 245 247 / 14%);
   background: rgb(139 139 148 / 72%);
   color: #f9fafb;
-}
-
-.utility-button:hover {
-  border-color: rgb(245 245 247 / 28%);
-  background: rgb(164 164 172 / 82%);
-  box-shadow: 0 10px 24px rgb(0 0 0 / 22%);
-  transform: translateY(-1px);
 }
 
 .conversation-button {
@@ -1108,7 +1057,6 @@ button {
   transform: translateY(-1px);
 }
 
-.icon-camera,
 .icon-video,
 .icon-mic,
 .icon-pause,
@@ -1118,36 +1066,6 @@ button {
 .icon-send {
   position: relative;
   display: block;
-}
-
-.icon-camera {
-  width: 20px;
-  height: 15px;
-  border: 2px solid currentColor;
-  border-radius: 4px;
-}
-
-.icon-camera::before {
-  position: absolute;
-  top: -5px;
-  left: 4px;
-  width: 8px;
-  height: 4px;
-  border: 2px solid currentColor;
-  border-bottom: 0;
-  border-radius: 3px 3px 0 0;
-  content: "";
-}
-
-.icon-camera::after {
-  position: absolute;
-  top: 4px;
-  left: 6px;
-  width: 5px;
-  height: 5px;
-  border: 2px solid currentColor;
-  border-radius: 50%;
-  content: "";
 }
 
 .icon-video {
@@ -1290,12 +1208,12 @@ button {
   display: flex;
   justify-content: space-between;
   gap: 16px;
-  margin: 18px 0 0;
-  border-top: 1px solid rgb(70 69 86 / 24%);
-  padding: 14px 4px 0;
-  color: #fde047;
+  margin: 14px 0 0;
+  border-top: 1px solid rgb(70 69 86 / 16%);
+  padding: 11px 4px 0;
+  color: rgb(226 226 230 / 72%);
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.75rem;
+  font-size: 0.7rem;
 }
 
 .debug-stats div {
@@ -1383,7 +1301,6 @@ button {
     padding: 10px 12px;
   }
 
-  .utility-button,
   .end-call-button {
     width: 52px;
     height: 52px;

@@ -89,3 +89,34 @@ export type ConversationTurnErrorResponse = {
   cost: CostStats;
   timing: { totalMs: number };
 };
+
+export type SpeechTranscriptionErrorCode =
+  | "EMPTY_AUDIO"
+  | "INVALID_AUDIO"
+  | "EMPTY_TRANSCRIPTION"
+  | "MODEL_CONFIG_INVALID"
+  | "MODEL_CONFIG_MISSING"
+  | "MODEL_PROVIDER_ERROR"
+  | "MODEL_PROVIDER_TIMEOUT";
+
+export type SpeechTranscriptionSuccessResponse = {
+  ok: true;
+  text: string;
+  model: { provider: "openai-compatible"; name: string };
+  timing: { totalMs: number; modelMs: number | null };
+};
+
+export type SpeechTranscriptionErrorResponse = {
+  ok: false;
+  error: {
+    code: SpeechTranscriptionErrorCode;
+    message: string;
+    retryable: boolean;
+    details?: Record<string, unknown>;
+  };
+  timing: { totalMs: number };
+};
+
+export type SpeechTranscriptionResponse =
+  | SpeechTranscriptionSuccessResponse
+  | SpeechTranscriptionErrorResponse;

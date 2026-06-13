@@ -43,6 +43,7 @@ export type ConversationTurnRequest = {
 type ConfiguredModelConfigStatus<TSource extends "runtime" | "env"> = {
   ok: true;
   source: TSource;
+  asrModelName?: string;
   baseUrl: string;
   hasApiKey: true;
   maxOutputTokens: number;
@@ -71,6 +72,7 @@ export type ModelConfigStatus =
 
 export type RuntimeModelConfigInput = {
   apiKey: string;
+  asrModelName?: string;
   baseUrl: string;
   maxOutputTokens: number;
   modelName: string;
@@ -120,7 +122,31 @@ export type ConversationTurnResponse =
       timing: { totalMs: number };
     };
 
+export type SpeechTranscriptionResponse =
+  | {
+      ok: true;
+      text: string;
+      model?: {
+        name: string;
+        provider: "openai-compatible";
+      };
+      timing?: { totalMs: number; modelMs?: number | null };
+    }
+  | {
+      ok: false;
+      error: {
+        code: string;
+        details?: Record<string, unknown>;
+        message: string;
+        retryable: boolean;
+      };
+      timing: { totalMs: number };
+    };
+
 type FetchFn = typeof fetch;
+type SpeechTranscriptionMetadata = {
+  sessionId?: string | null;
+};
 
 type StreamHandlers = {
   onComplete?: (response: Extract<ConversationTurnResponse, { ok: true }>) => void;
@@ -187,6 +213,27 @@ export async function putModelConfig(
   }
 
   return responseBody as RuntimeModelConfigStatus;
+}
+
+export async function postSpeechTranscription(
+  audio: Blob,
+  metadata: SpeechTranscriptionMetadata = {},
+  fetchFn: FetchFn = fetch
+) {
+  const formData = new FormData();
+
+  formData.append("audio", audio, "voice.webm");
+
+  if (metadata.sessionId) {
+    formData.append("sessionId", metadata.sessionId);
+  }
+
+  const response = await fetchFn("/api/speech-transcription", {
+    body: formData,
+    method: "POST"
+  });
+
+  return (await response.json()) as SpeechTranscriptionResponse;
 }
 
 function parseSseBlock(block: string): ParsedSseEvent {

@@ -17,11 +17,17 @@ import {
   createOpenAiCompatibleMultimodalProvider,
   type MultimodalProvider
 } from "./multimodal-provider";
+import {
+  createOpenAiCompatibleSpeechTranscriptionProvider,
+  createSpeechTranscriptionHandler,
+  type SpeechTranscriptionProvider
+} from "./speech-transcription";
 
 type CreateAppOptions = {
   costControlService?: CostControlService;
   modelConfigService?: ModelConfigService;
   multimodalProvider?: MultimodalProvider;
+  speechTranscriptionProvider?: SpeechTranscriptionProvider;
 };
 
 export function createApp(options: CreateAppOptions = {}) {
@@ -32,6 +38,9 @@ export function createApp(options: CreateAppOptions = {}) {
     options.modelConfigService ?? createModelConfigService();
   const multimodalProvider =
     options.multimodalProvider ?? createOpenAiCompatibleMultimodalProvider();
+  const speechTranscriptionProvider =
+    options.speechTranscriptionProvider ??
+    createOpenAiCompatibleSpeechTranscriptionProvider();
 
   app.use(express.json({ limit: CONVERSATION_BODY_LIMIT }));
 
@@ -61,6 +70,13 @@ export function createApp(options: CreateAppOptions = {}) {
 
     response.json(result.status);
   });
+  app.post(
+    "/api/speech-transcription",
+    createSpeechTranscriptionHandler(
+      speechTranscriptionProvider,
+      modelConfigService
+    )
+  );
 
   app.post(
     "/api/conversation-turn",

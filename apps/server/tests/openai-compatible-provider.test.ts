@@ -110,6 +110,9 @@ describe("createOpenAiCompatibleMultimodalProvider", () => {
       max_tokens: 128,
       messages: [
         {
+          role: "system"
+        },
+        {
           content: "上一轮问题",
           role: "user"
         },
@@ -132,6 +135,10 @@ describe("createOpenAiCompatibleMultimodalProvider", () => {
       model: "vision-model",
       stream: false
     });
+    expect(payload.messages[0].content).toContain("视频通话");
+    expect(payload.messages[0].content).toContain("不要说");
+    expect(payload.messages[0].content).toContain("图片");
+    expect(payload.messages[0].content).toContain("关键帧");
     expect(init.signal).toBeInstanceOf(AbortSignal);
     expect(result).toMatchObject({
       modelName: "vision-model",

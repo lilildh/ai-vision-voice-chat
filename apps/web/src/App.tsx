@@ -14,7 +14,9 @@ import {
   type ConversationTurnResponse,
   type ConversationTurnStatusPhase,
   type ModelConfigStatus,
+  type SpeechTranscriptionResponse,
   getModelConfig,
+  postSpeechTranscription,
   putModelConfig,
   streamConversationTurn
 } from "./conversation-client";
@@ -52,6 +54,7 @@ type HealthResponse = {
 
 type ModelConfigFormState = {
   apiKey: string;
+  asrModelName: string;
   baseUrl: string;
   maxOutputTokens: string;
   modelName: string;
@@ -66,11 +69,16 @@ const initialStats: ConversationSessionStats = {
 };
 const initialModelConfigForm: ModelConfigFormState = {
   apiKey: "",
+  asrModelName: "",
   baseUrl: "",
   maxOutputTokens: "512",
   modelName: "",
   timeoutMs: "30000"
 };
+const audioMonitorIntervalMs = 200;
+const mediaRecorderTimesliceMs = 250;
+const voiceActivityThreshold = 10;
+const voiceTurnSilenceMs = 1800;
 
 function stopMediaStream(stream: MediaStream | null) {
   stream?.getTracks().forEach((track) => {
@@ -84,6 +92,50 @@ function getErrorMessage(error: unknown) {
   }
 
   return "无法访问摄像头，请检查浏览器权限。";
+}
+
+function getDetailString(
+  details: Record<string, unknown> | undefined,
+  key: string
+) {
+  const value = details?.[key];
+
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getDetailNumber(
+  details: Record<string, unknown> | undefined,
+  key: string
+) {
+  const value = details?.[key];
+
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatSpeechTranscriptionError(
+  error: Extract<SpeechTranscriptionResponse, { ok: false }>["error"]
+) {
+  let message = `${error.code}：${error.message}`;
+
+  if (error.code !== "MODEL_PROVIDER_ERROR") {
+    return message;
+  }
+
+  const providerStatus = getDetailNumber(error.details, "providerStatus");
+  const providerText = getDetailString(error.details, "providerText");
+
+  if (providerStatus !== null) {
+    message += `（provider ${providerStatus}）`;
+  }
+
+  message +=
+    "请检查 Base URL、API Key、ASR 模型名称是否支持 OpenAI-compatible audio/transcriptions。";
+
+  if (providerText) {
+    message += `provider 返回：${providerText}`;
+  }
+
+  return message;
 }
 
 function createSessionId() {
@@ -114,8 +166,31 @@ function toRequestKeyframe(keyframe: CapturedKeyframe) {
   };
 }
 
-function getSpeechRecognitionConstructor() {
-  return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null;
+function getAudioContextConstructor() {
+  return window.AudioContext ?? window.webkitAudioContext ?? null;
+}
+
+function getPreferredAudioMimeType() {
+  if (!window.MediaRecorder) {
+    return "";
+  }
+
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+
+  return (
+    candidates.find((candidate) => window.MediaRecorder.isTypeSupported(candidate)) ??
+    ""
+  );
+}
+
+function createAudioOnlyStream(stream: MediaStream) {
+  const audioTracks = stream.getAudioTracks();
+
+  if (audioTracks.length === 0) {
+    return null;
+  }
+
+  return new MediaStream(audioTracks);
 }
 
 function getModelConfigSourceLabel(status: ModelConfigStatus | null) {
@@ -144,6 +219,7 @@ function createFormFromModelConfigStatus(
   if (status.source === "runtime" || status.source === "env") {
     return {
       apiKey: "",
+      asrModelName: status.asrModelName ?? "",
       baseUrl: status.baseUrl,
       maxOutputTokens: String(status.maxOutputTokens),
       modelName: status.modelName,
@@ -157,13 +233,21 @@ function createFormFromModelConfigStatus(
 export function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const messageBottomRef = useRef<HTMLDivElement | null>(null);
-  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioAnalyserRef = useRef<AnalyserNode | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioMonitorIntervalRef = useRef<number | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const shouldStickToBottomRef = useRef(true);
   const shouldResumeListeningRef = useRef(false);
   const isRecognitionActiveRef = useRef(false);
   const isSubmittingRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const frameBufferIntervalRef = useRef<number | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const isVoiceSegmentActiveRef = useRef(false);
+  const shouldSubmitRecordedAudioRef = useRef(false);
+  const voiceSilenceElapsedMsRef = useRef(0);
   const keyframesRef = useRef<BufferedKeyframe[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const stoppedMediaStreamsRef = useRef<WeakSet<MediaStream>>(new WeakSet());
@@ -301,6 +385,135 @@ export function App() {
     setSpeechStatus(nextStatus);
   }
 
+  function stopAudioMonitoring() {
+    if (audioMonitorIntervalRef.current !== null) {
+      window.clearInterval(audioMonitorIntervalRef.current);
+      audioMonitorIntervalRef.current = null;
+    }
+  }
+
+  function closeAudioProcessing() {
+    stopAudioMonitoring();
+    audioSourceRef.current?.disconnect();
+    audioSourceRef.current = null;
+    audioAnalyserRef.current = null;
+    void audioContextRef.current?.close();
+    audioContextRef.current = null;
+    isVoiceSegmentActiveRef.current = false;
+    voiceSilenceElapsedMsRef.current = 0;
+  }
+
+  function readAudioLevel() {
+    const analyser = audioAnalyserRef.current;
+
+    if (!analyser) {
+      return 0;
+    }
+
+    const samples = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteTimeDomainData(samples);
+
+    if (samples.length === 0) {
+      return 0;
+    }
+
+    let total = 0;
+
+    for (const sample of samples) {
+      total += Math.abs(sample - 128);
+    }
+
+    return total / samples.length;
+  }
+
+  function stopRecorderForSubmission() {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recorder || recorder.state === "inactive") {
+      return;
+    }
+
+    shouldSubmitRecordedAudioRef.current = true;
+    recorder.stop();
+  }
+
+  function sampleVoiceActivity() {
+    if (
+      !isRecognitionActiveRef.current ||
+      isSubmittingRef.current ||
+      isSpeakingRef.current
+    ) {
+      return;
+    }
+
+    const level = readAudioLevel();
+
+    if (level >= voiceActivityThreshold) {
+      isVoiceSegmentActiveRef.current = true;
+      voiceSilenceElapsedMsRef.current = 0;
+      setSpeechStatusState("transcribing");
+      return;
+    }
+
+    if (!isVoiceSegmentActiveRef.current) {
+      return;
+    }
+
+    voiceSilenceElapsedMsRef.current += audioMonitorIntervalMs;
+
+    if (voiceSilenceElapsedMsRef.current >= voiceTurnSilenceMs) {
+      stopRecorderForSubmission();
+    }
+  }
+
+  function resetSpeechTranscriptDisplay({
+    updateDisplay = true
+  }: {
+    updateDisplay?: boolean;
+  } = {}) {
+    if (updateDisplay) {
+      setInterimTranscript("");
+      setLastTranscript("");
+    }
+  }
+
+  async function submitRecordedAudioTurn(audio: Blob) {
+    setSpeechStatusState("transcribing");
+    setErrorMessage(null);
+    setErrorCloudCallLabel(null);
+
+    try {
+      const response = await postSpeechTranscription(audio, {
+        sessionId: sessionIdRef.current
+      });
+
+      if (!response.ok) {
+        shouldResumeListeningRef.current = false;
+        setSpeechStatusState("error");
+        setErrorMessage(formatSpeechTranscriptionError(response.error));
+        return;
+      }
+
+      const text = response.text.trim();
+
+      if (!text) {
+        shouldResumeListeningRef.current = false;
+        setSpeechStatusState("error");
+        setErrorMessage("EMPTY_TRANSCRIPTION：云端语音识别没有返回可用文本，请再说一次。");
+        return;
+      }
+
+      setInterimTranscript("");
+      setLastTranscript(text);
+      setPromptText(text);
+      await submitQuestionText(text, "voice");
+    } catch (error) {
+      shouldResumeListeningRef.current = false;
+      setSpeechStatusState("error");
+      setErrorMessage(getErrorMessage(error));
+    }
+  }
+
   function stopTrackedMediaStream(stream: MediaStream | null) {
     if (!stream || stoppedMediaStreamsRef.current.has(stream)) {
       return;
@@ -418,6 +631,7 @@ export function App() {
     try {
       const status = await putModelConfig({
         apiKey: modelConfigForm.apiKey,
+        asrModelName: modelConfigForm.asrModelName,
         baseUrl: modelConfigForm.baseUrl,
         maxOutputTokens,
         modelName: modelConfigForm.modelName,
@@ -427,6 +641,7 @@ export function App() {
       setModelConfigStatus(status);
       setModelConfigForm({
         apiKey: "",
+        asrModelName: status.asrModelName ?? "",
         baseUrl: status.baseUrl,
         maxOutputTokens: String(status.maxOutputTokens),
         modelName: status.modelName,
@@ -574,7 +789,7 @@ export function App() {
   useEffect(() => {
     return () => {
       stopFrameBuffering();
-      stopVoiceRecognition({ clearAutoResume: true });
+      stopVoiceRecognition({ clearAutoResume: true, updateStatus: false });
       window.speechSynthesis?.cancel();
     };
   }, []);
@@ -602,7 +817,7 @@ export function App() {
       stopTrackedMediaStream(mediaStreamRef.current ?? mediaStream);
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
+        audio: true,
         video: true
       });
       const nextSessionId = createSessionId();
@@ -624,8 +839,7 @@ export function App() {
       setSpeechStatusState("idle");
       setTtsStatus("idle");
       setTurnStatus("idle");
-      setInterimTranscript("");
-      setLastTranscript("");
+      resetSpeechTranscriptDisplay();
       setPendingAssistantText("");
       shouldResumeListeningRef.current = false;
 
@@ -667,8 +881,7 @@ export function App() {
     setSpeechStatusState("idle");
     setTtsStatus("idle");
     setTurnStatus("idle");
-    setInterimTranscript("");
-    setLastTranscript("");
+    resetSpeechTranscriptDisplay();
     setPendingAssistantText("");
     setErrorMessage(null);
     setErrorCloudCallLabel(null);
@@ -694,28 +907,38 @@ export function App() {
   }
 
   function stopVoiceRecognition({
-    clearAutoResume = true
+    clearAutoResume = true,
+    updateStatus = true
   }: {
     clearAutoResume?: boolean;
+    updateStatus?: boolean;
   } = {}) {
     if (clearAutoResume) {
       shouldResumeListeningRef.current = false;
+      resetSpeechTranscriptDisplay({ updateDisplay: updateStatus });
     }
 
-    const recognition = recognitionRef.current;
+    shouldSubmitRecordedAudioRef.current = false;
+    stopAudioMonitoring();
 
-    if (recognition) {
-      recognition.onend = null;
-      recognition.onerror = null;
-      recognition.onresult = null;
-      recognition.onstart = null;
-      recognition.abort();
+    const recorder = mediaRecorderRef.current;
+
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onstart = null;
+
+      if (recorder.state !== "inactive") {
+        recorder.stop();
+      }
     }
 
-    recognitionRef.current = null;
+    mediaRecorderRef.current = null;
+    audioChunksRef.current = [];
+    closeAudioProcessing();
     isRecognitionActiveRef.current = false;
 
-    if (speechStatusRef.current !== "unsupported") {
+    if (updateStatus && speechStatusRef.current !== "unsupported") {
       setSpeechStatusState("paused");
     }
   }
@@ -733,12 +956,14 @@ export function App() {
       return;
     }
 
-    const SpeechRecognitionConstructor = getSpeechRecognitionConstructor();
+    const AudioContextConstructor = getAudioContextConstructor();
+    const MediaRecorderConstructor = window.MediaRecorder;
 
-    if (!SpeechRecognitionConstructor) {
+    if (!AudioContextConstructor || !MediaRecorderConstructor) {
       shouldResumeListeningRef.current = false;
+      resetSpeechTranscriptDisplay();
       setSpeechStatusState("unsupported");
-      setErrorMessage("当前浏览器不支持语音识别，请使用 Chrome 或继续手动输入。");
+      setErrorMessage("当前浏览器不支持云端语音录制，请使用文本输入。");
       return;
     }
 
@@ -755,88 +980,89 @@ export function App() {
 
     stopVoiceRecognition({ clearAutoResume: false });
 
-    const recognition = new SpeechRecognitionConstructor();
-
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.lang = "zh-CN";
-    recognition.maxAlternatives = 1;
-
-    recognition.onstart = () => {
-      isRecognitionActiveRef.current = true;
-      setSpeechStatusState("listening");
-    };
-
-    recognition.onresult = (event) => {
-      let finalText = "";
-      let interimText = "";
-
-      for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const result = event.results[index];
-        const transcript = result[0]?.transcript ?? "";
-
-        if (result.isFinal) {
-          finalText += transcript;
-        } else {
-          interimText += transcript;
-        }
-      }
-
-      const trimmedInterimText = interimText.trim();
-      const trimmedFinalText = finalText.trim();
-
-      if (trimmedInterimText) {
-        setInterimTranscript(trimmedInterimText);
-        setSpeechStatusState("transcribing");
-      }
-
-      if (trimmedFinalText) {
-        setLastTranscript(trimmedFinalText);
-        setInterimTranscript("");
-        setPromptText(trimmedFinalText);
-        setSpeechStatusState("transcribing");
-        isRecognitionActiveRef.current = false;
-        void submitQuestionText(trimmedFinalText, "voice");
-      }
-    };
-
-    recognition.onerror = (event) => {
-      isRecognitionActiveRef.current = false;
-      shouldResumeListeningRef.current = false;
-      setSpeechStatusState("error");
-      setErrorMessage(`语音识别失败：${event.error}。请重试或使用文本输入。`);
-    };
-
-    recognition.onend = () => {
-      isRecognitionActiveRef.current = false;
-
-      if (
-        shouldResumeListeningRef.current &&
-        !isSubmittingRef.current &&
-        !isSpeakingRef.current &&
-        sessionStatusRef.current === "active"
-      ) {
-        startVoiceListening();
-        return;
-      }
-
-      if (
-        speechStatusRef.current !== "unsupported" &&
-        speechStatusRef.current !== "error"
-      ) {
-        setSpeechStatusState("paused");
-      }
-    };
-
-    recognitionRef.current = recognition;
-
     try {
-      recognition.start();
+      const audioStream = createAudioOnlyStream(mediaStreamRef.current);
+
+      if (!audioStream) {
+        throw new Error("当前会话没有可用的麦克风音轨，请检查麦克风权限。");
+      }
+
+      const audioContext = new AudioContextConstructor();
+      const source = audioContext.createMediaStreamSource(audioStream);
+      const analyser = audioContext.createAnalyser();
+      const mimeType = getPreferredAudioMimeType();
+      const recorder = new MediaRecorderConstructor(
+        audioStream,
+        mimeType ? { mimeType } : undefined
+      );
+
+      analyser.fftSize = 32;
+      source.connect(analyser);
+      audioContextRef.current = audioContext;
+      audioSourceRef.current = source;
+      audioAnalyserRef.current = analyser;
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = recorder;
+      shouldSubmitRecordedAudioRef.current = false;
+      isVoiceSegmentActiveRef.current = false;
+      voiceSilenceElapsedMsRef.current = 0;
+
+      recorder.onstart = () => {
+        isRecognitionActiveRef.current = true;
+        setSpeechStatusState("listening");
+      };
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const shouldSubmit = shouldSubmitRecordedAudioRef.current;
+        const audioChunks = audioChunksRef.current;
+        const audioType = mimeType || audioChunks[0]?.type || "audio/webm";
+
+        shouldSubmitRecordedAudioRef.current = false;
+        mediaRecorderRef.current = null;
+        audioChunksRef.current = [];
+        isRecognitionActiveRef.current = false;
+        closeAudioProcessing();
+
+        if (
+          shouldSubmit &&
+          audioChunks.length > 0 &&
+          shouldResumeListeningRef.current &&
+          sessionStatusRef.current === "active"
+        ) {
+          void submitRecordedAudioTurn(
+            new Blob(audioChunks, {
+              type: audioType
+            })
+          );
+          return;
+        }
+
+        if (
+          speechStatusRef.current !== "unsupported" &&
+          speechStatusRef.current !== "error"
+        ) {
+          setSpeechStatusState("paused");
+        }
+      };
+
+      recorder.start(mediaRecorderTimesliceMs);
       isRecognitionActiveRef.current = true;
       setSpeechStatusState("listening");
+      audioMonitorIntervalRef.current = window.setInterval(
+        sampleVoiceActivity,
+        audioMonitorIntervalMs
+      );
     } catch (error) {
       isRecognitionActiveRef.current = false;
       shouldResumeListeningRef.current = false;
+      resetSpeechTranscriptDisplay();
+      closeAudioProcessing();
       setSpeechStatusState("error");
       setErrorMessage(getErrorMessage(error));
     }
@@ -934,18 +1160,6 @@ export function App() {
       sessionStatusRef.current === "active"
     ) {
       startVoiceListening();
-    }
-  }
-
-  function captureKeyframe() {
-    try {
-      const keyframe = captureFrame(keyframes.length);
-
-      setErrorMessage(null);
-      setErrorCloudCallLabel(null);
-      appendKeyframeToBuffer(keyframe, { force: true });
-    } catch (error) {
-      setErrorMessage(getErrorMessage(error));
     }
   }
 
@@ -1183,6 +1397,17 @@ export function App() {
                 />
               </label>
               <label>
+                <span>ASR 模型名称</span>
+                <input
+                  autoComplete="off"
+                  value={modelConfigForm.asrModelName}
+                  onChange={(event) =>
+                    updateModelConfigField("asrModelName", event.target.value)
+                  }
+                  placeholder="speech-to-text-model"
+                />
+              </label>
+              <label>
                 <span>API Key</span>
                 <input
                   autoComplete="off"
@@ -1307,29 +1532,7 @@ export function App() {
                       <span className="icon-memory" />
                     </div>
                     <div className="message-bubble assistant-bubble">
-                      <p>摄像头已连接，可以直接说话提问，也可以输入文本验证视觉链路。</p>
-                      <div className="keyframe-strip" aria-label="关键帧预览">
-                        {keyframes.length > 0 ? (
-                          keyframes.map((keyframe, index) => (
-                            <figure className="keyframe-card" key={keyframe.id}>
-                              <img
-                                src={keyframe.previewUrl}
-                                alt={`关键帧 ${index + 1}`}
-                              />
-                              <figcaption>
-                                {new Date(keyframe.capturedAt).toLocaleTimeString(
-                                  "zh-CN",
-                                  {
-                                    hour12: false
-                                  }
-                                )}
-                              </figcaption>
-                            </figure>
-                          ))
-                        ) : (
-                          <span className="empty-keyframes">暂无关键帧</span>
-                        )}
-                      </div>
+                      <p>摄像头已连接，可以直接说话提问。文本输入会作为备用入口保留。</p>
                     </div>
                   </div>
                 </article>
@@ -1453,14 +1656,6 @@ export function App() {
 
             <div className="control-buttons" aria-label="对话控制">
               <button
-                className="round-button utility-button"
-                type="button"
-                aria-label="截取关键帧"
-                onClick={captureKeyframe}
-              >
-                <span className="icon-camera" aria-hidden="true" />
-              </button>
-              <button
                 className={`round-button conversation-button ${
                   isSpeechListening ? "listening" : ""
                 }`}
@@ -1483,15 +1678,15 @@ export function App() {
 
             <dl className="debug-stats" aria-label="调试统计">
               <div>
-                <dt>Lat:</dt>
+                <dt>延迟:</dt>
                 <dd>{latencyLabel}</dd>
               </div>
               <div>
-                <dt>Buffer:</dt>
+                <dt>视觉:</dt>
                 <dd>{frameCountLabel}</dd>
               </div>
               <div>
-                <dt>Cost:</dt>
+                <dt>成本:</dt>
                 <dd>{modelCostLabel}</dd>
               </div>
             </dl>

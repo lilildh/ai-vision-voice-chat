@@ -87,8 +87,16 @@ type OpenAiMessage = {
             type: "image_url";
           }
       >;
-  role: "assistant" | "user";
+  role: "assistant" | "system" | "user";
 };
+
+const videoChatSystemPrompt = [
+  "你正在和用户进行自然的视频通话。",
+  "用户问题会附带当前摄像头画面的低频关键帧，这些关键帧只用于帮助你理解用户此刻正在让你看的内容。",
+  "回答时要像正在看对方的视频画面一样表达，优先使用“我看到”“你这里”“现在”“这个位置”等说法。",
+  "不要说“图片”“截图”“图像”“关键帧”“根据图片”“从图中看”“画面中的图片”等会暴露上传图片分析流程的词。",
+  "如果无法判断，直接说明不确定并给出你能看到的线索。"
+].join("\n");
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -103,6 +111,10 @@ function buildChatCompletionsUrl(baseUrl: string) {
 }
 
 function buildMessages(request: MultimodalProviderRequest): OpenAiMessage[] {
+  const systemMessage: OpenAiMessage = {
+    content: videoChatSystemPrompt,
+    role: "system"
+  };
   const historyMessages = request.messages.map((message) => ({
     content: message.text,
     role: message.role
@@ -123,7 +135,7 @@ function buildMessages(request: MultimodalProviderRequest): OpenAiMessage[] {
     role: "user"
   };
 
-  return [...historyMessages, currentUserMessage];
+  return [systemMessage, ...historyMessages, currentUserMessage];
 }
 
 function buildPayload(request: MultimodalProviderRequest, stream: boolean) {

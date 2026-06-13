@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 
 const originalModelEnv = {
+  MODEL_ASR_NAME: process.env.MODEL_ASR_NAME,
   MODEL_API_KEY: process.env.MODEL_API_KEY,
   MODEL_BASE_URL: process.env.MODEL_BASE_URL,
   MODEL_MAX_OUTPUT_TOKENS: process.env.MODEL_MAX_OUTPUT_TOKENS,
@@ -22,6 +23,7 @@ function restoreModelEnv() {
 }
 
 function clearModelEnv() {
+  delete process.env.MODEL_ASR_NAME;
   delete process.env.MODEL_API_KEY;
   delete process.env.MODEL_BASE_URL;
   delete process.env.MODEL_MAX_OUTPUT_TOKENS;
@@ -31,6 +33,7 @@ function clearModelEnv() {
 
 function setModelEnv(overrides: NodeJS.ProcessEnv = {}) {
   process.env.MODEL_API_KEY = "env-key";
+  process.env.MODEL_ASR_NAME = "env-asr-model";
   process.env.MODEL_BASE_URL = "https://env-model.example.test/v1";
   process.env.MODEL_NAME = "env-vision-model";
 
@@ -104,6 +107,7 @@ describe("model config routes", () => {
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({
       baseUrl: "https://env-model.example.test/v1",
+      asrModelName: "env-asr-model",
       hasApiKey: true,
       maxOutputTokens: 1024,
       modelName: "env-vision-model",
@@ -169,6 +173,7 @@ describe("model config routes", () => {
     const putRequest = createRequest({
       body: {
         apiKey: "runtime-secret",
+        asrModelName: "runtime-asr-model",
         baseUrl: "https://runtime-model.example.test/v1",
         maxOutputTokens: 640,
         modelName: "runtime-vision-model",
@@ -187,6 +192,7 @@ describe("model config routes", () => {
     expect(putResponse._getStatusCode()).toBe(200);
     expect(putResponse._getJSONData()).toMatchObject({
       baseUrl: "https://runtime-model.example.test/v1",
+      asrModelName: "runtime-asr-model",
       hasApiKey: true,
       maxOutputTokens: 640,
       modelName: "runtime-vision-model",
@@ -207,6 +213,7 @@ describe("model config routes", () => {
     expect(getResponse._getStatusCode()).toBe(200);
     expect(getResponse._getJSONData()).toMatchObject({
       baseUrl: "https://runtime-model.example.test/v1",
+      asrModelName: "runtime-asr-model",
       hasApiKey: true,
       maxOutputTokens: 640,
       modelName: "runtime-vision-model",

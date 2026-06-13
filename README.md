@@ -6,14 +6,15 @@
 
 ## 当前状态
 
-当前仓库已具备首版流式多模态对话闭环。前端通过浏览器摄像头、Web Speech API 和 `speechSynthesis` 完成采集与播报；后端通过 OpenAI-compatible provider 代理真实多模态模型，并负责校验、限流、会话轮次限制和成本估算。
+当前仓库已具备首版流式多模态对话闭环。前端通过浏览器摄像头、`MediaRecorder`、Web Audio 和 `speechSynthesis` 完成采集与播报；后端通过 OpenAI-compatible provider 代理真实云端 ASR 和多模态模型，并负责校验、限流、会话轮次限制和成本估算。
 
 已完成内容：
 
 - 产品定位与首版范围
 - 用户故事与非目标场景
 - 摄像头预览、关键帧截取、压缩和每轮 3 张上限
-- Web Speech API 语音转写、手动文本提问和浏览器 TTS 播报
+- 云端 ASR 语音转写、手动文本提问和浏览器 TTS 播报
+- `POST /api/speech-transcription` 云端语音转写接口
 - 流式 `/api/conversation-turn/stream` 多模态对话接口
 - 保留非流式 `/api/conversation-turn` 兼容接口
 - OpenAI-compatible 多模态 provider，支持非流式和 `stream: true`
@@ -48,6 +49,7 @@ npm run dev
 export MODEL_BASE_URL="https://your-openai-compatible-host/v1"
 export MODEL_API_KEY="your-api-key"
 export MODEL_NAME="your-vision-model"
+export MODEL_ASR_NAME="your-speech-to-text-model"
 export MODEL_TIMEOUT_MS=30000
 export MODEL_MAX_OUTPUT_TOKENS=512
 ```
@@ -88,6 +90,7 @@ GET /api/model-config
 PUT /api/model-config
 POST /api/conversation-turn
 POST /api/conversation-turn/stream
+POST /api/speech-transcription
 ```
 
 健康检查返回：
@@ -114,10 +117,10 @@ data: {"ok":true,"reply":{"role":"assistant","text":"我看到..."}}
 
 真实模型 smoke test：
 
-1. 设置 `MODEL_BASE_URL`、`MODEL_API_KEY`、`MODEL_NAME`。
+1. 设置 `MODEL_BASE_URL`、`MODEL_API_KEY`、`MODEL_NAME`、`MODEL_ASR_NAME`。
 2. 运行 `npm run dev`。
-3. 用 Chrome 打开 Vite 页面，允许摄像头权限。
-4. 点击麦克风提问三轮，包含一次“它/左边那个”等指代追问。
+3. 用 Chrome 打开 Vite 页面，允许摄像头和麦克风权限。
+4. 点击开始对话后直接说话提问三轮，包含一次“它/左边那个”等指代追问。
 5. 确认回复文本流式出现、TTS 在完成后播报、错误/限流/成本状态可见。
 
 ## 核心设计
@@ -128,17 +131,18 @@ data: {"ok":true,"reply":{"role":"assistant","text":"我看到..."}}
 
 1. 用户打开摄像头和麦克风。
 2. 用户用语音提出问题。
-3. 浏览器通过 Web Speech API 生成语音转写。
-4. 前端在用户说完后截取 1 张默认关键帧，必要时最多补充到 3 张。
-5. 前端压缩关键帧，并将文本、关键帧和短期上下文发送到后端。
-6. 后端执行 schema 校验、限流、预算检查和模型调用。
-7. 前端展示 AI 文本回复，并用浏览器 TTS 播报。
+3. 浏览器用 `MediaRecorder` 录制本轮语音，并通过 Web Audio 静默检测判断一轮结束。
+4. 前端将音频片段发送到后端云端 ASR 接口生成语音转写。
+5. 前端在用户说完后截取 1 张默认关键帧，必要时最多补充到 3 张。
+6. 前端压缩关键帧，并将文本、关键帧和短期上下文发送到后端。
+7. 后端执行 schema 校验、限流、预算检查和模型调用。
+8. 前端展示 AI 文本回复，并用浏览器 TTS 播报。
 
 ## 技术方向
 
 - 前端：Vite + React + TypeScript
 - 后端：Node.js + Express
-- ASR：优先使用浏览器 Web Speech API
+- ASR：浏览器录音 + 后端 OpenAI-compatible `audio/transcriptions`
 - TTS：优先使用浏览器 `speechSynthesis`
 - 模型：通过后端 OpenAI-compatible 多模态 provider 调用
 - 配置：通过环境变量配置模型服务地址、模型名和 API Key
@@ -159,4 +163,4 @@ data: {"ok":true,"reply":{"role":"assistant","text":"我看到..."}}
 2. 验证三轮语音问答、指代追问、流式文本、TTS 播报和错误展示。
 3. 根据真实模型延迟和 token usage 调整 `MODEL_MAX_OUTPUT_TOKENS` 与成本估算参数。
 4. 记录目标 provider 对 `stream_options.include_usage` 的兼容性。
-5. 根据演示反馈决定是否增加云端 ASR/TTS 或多模型路由。
+5. 根据演示反馈决定是否增加云端 TTS 或多模型路由。

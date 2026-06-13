@@ -1,5 +1,6 @@
 export type ResolvedModelConfig = {
   apiKey: string;
+  asrModelName?: string;
   baseUrl: string;
   maxOutputTokens: number;
   modelName: string;
@@ -86,6 +87,7 @@ type ConfiguredModelConfigStatus<TSource extends "runtime" | "env"> = {
   hasApiKey: true;
   maxOutputTokens: number;
   modelName: string;
+  asrModelName?: string;
   timeoutMs: number;
 };
 
@@ -171,6 +173,9 @@ export function readModelConfig(env: NodeJS.ProcessEnv): ModelConfig {
 
   return {
     apiKey: env.MODEL_API_KEY!.trim(),
+    ...(isNonEmptyString(env.MODEL_ASR_NAME)
+      ? { asrModelName: env.MODEL_ASR_NAME.trim() }
+      : {}),
     baseUrl: env.MODEL_BASE_URL!.trim(),
     maxOutputTokens: optionalConfig.maxOutputTokens,
     modelName: env.MODEL_NAME!.trim(),
@@ -184,6 +189,7 @@ function toConfiguredStatus<TSource extends "runtime" | "env">(
   config: ResolvedModelConfig
 ): ConfiguredModelConfigStatus<TSource> {
   return {
+    ...(config.asrModelName ? { asrModelName: config.asrModelName } : {}),
     baseUrl: config.baseUrl,
     hasApiKey: true,
     maxOutputTokens: config.maxOutputTokens,
@@ -216,6 +222,15 @@ function validateRuntimeModelConfig(body: unknown): RuntimeModelConfigResult {
     invalid.push("modelName");
   }
 
+  if (
+    body.asrModelName !== undefined &&
+    body.asrModelName !== null &&
+    body.asrModelName !== "" &&
+    !isNonEmptyString(body.asrModelName)
+  ) {
+    invalid.push("asrModelName");
+  }
+
   const timeoutMs = parseRuntimePositiveNumber(
     body.timeoutMs,
     defaultModelTimeoutMs
@@ -242,6 +257,9 @@ function validateRuntimeModelConfig(body: unknown): RuntimeModelConfigResult {
 
   const config: ResolvedModelConfig = {
     apiKey: String(body.apiKey).trim(),
+    ...(isNonEmptyString(body.asrModelName)
+      ? { asrModelName: String(body.asrModelName).trim() }
+      : {}),
     baseUrl: String(body.baseUrl).trim(),
     maxOutputTokens: maxOutputTokens ?? defaultMaxOutputTokens,
     modelName: String(body.modelName).trim(),
@@ -313,6 +331,9 @@ export function createModelConfigService(env: NodeJS.ProcessEnv = process.env) {
     const input = body as Record<string, unknown>;
     runtimeConfig = {
       apiKey: String(input.apiKey).trim(),
+      ...(isNonEmptyString(input.asrModelName)
+        ? { asrModelName: String(input.asrModelName).trim() }
+        : {}),
       baseUrl: String(input.baseUrl).trim(),
       maxOutputTokens: validation.status.maxOutputTokens,
       modelName: String(input.modelName).trim(),
