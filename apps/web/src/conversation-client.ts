@@ -40,6 +40,57 @@ export type ConversationTurnRequest = {
   text: string;
 };
 
+type ConfiguredModelConfigStatus<TSource extends "runtime" | "env"> = {
+  ok: true;
+  source: TSource;
+  baseUrl: string;
+  hasApiKey: true;
+  maxOutputTokens: number;
+  modelName: string;
+  timeoutMs: number;
+};
+
+type RuntimeModelConfigStatus = ConfiguredModelConfigStatus<"runtime">;
+type EnvModelConfigStatus = ConfiguredModelConfigStatus<"env">;
+
+export type ModelConfigStatus =
+  | RuntimeModelConfigStatus
+  | EnvModelConfigStatus
+  | {
+      ok: true;
+      source: "missing";
+      hasApiKey: boolean;
+      missing: string[];
+    }
+  | {
+      ok: true;
+      source: "invalid";
+      hasApiKey: boolean;
+      invalid: Array<{ name: string; value: string }>;
+    };
+
+export type RuntimeModelConfigInput = {
+  apiKey: string;
+  baseUrl: string;
+  maxOutputTokens: number;
+  modelName: string;
+  timeoutMs: number;
+};
+
+type ModelConfigErrorResponse = {
+  error: {
+    code: string;
+    message: string;
+  };
+  ok: false;
+};
+
+function isModelConfigErrorResponse(
+  value: ModelConfigStatus | ModelConfigErrorResponse
+): value is ModelConfigErrorResponse {
+  return value.ok === false;
+}
+
 export type ConversationTurnResponse =
   | {
       ok: true;
@@ -96,6 +147,46 @@ export async function postConversationTurn(
   });
 
   return (await response.json()) as ConversationTurnResponse;
+}
+
+export async function getModelConfig(fetchFn: FetchFn = fetch) {
+  const response = await fetchFn("/api/model-config", {
+    method: "GET"
+  });
+
+  if (!response.ok) {
+    throw new Error("无法读取模型配置。");
+  }
+
+  return (await response.json()) as ModelConfigStatus;
+}
+
+export async function putModelConfig(
+  body: RuntimeModelConfigInput,
+  fetchFn: FetchFn = fetch
+): Promise<RuntimeModelConfigStatus> {
+  const response = await fetchFn("/api/model-config", {
+    body: JSON.stringify(body),
+    headers: {
+      "content-type": "application/json"
+    },
+    method: "PUT"
+  });
+  const responseBody = (await response.json()) as
+    | ModelConfigStatus
+    | ModelConfigErrorResponse;
+
+  if (isModelConfigErrorResponse(responseBody)) {
+    throw new Error(
+      `${responseBody.error.code}：${responseBody.error.message}`
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error("无法保存模型配置。");
+  }
+
+  return responseBody as RuntimeModelConfigStatus;
 }
 
 function parseSseBlock(block: string): ParsedSseEvent {

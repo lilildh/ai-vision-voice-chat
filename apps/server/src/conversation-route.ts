@@ -13,7 +13,10 @@ import type {
   CostStats
 } from "./conversation-contract";
 import { validateConversationTurnRequest } from "./conversation-validation";
-import { readModelConfig } from "./model-config";
+import {
+  createModelConfigService,
+  type ModelConfigService
+} from "./model-config";
 import {
   MultimodalProviderError,
   createOpenAiCompatibleMultimodalProvider,
@@ -146,7 +149,8 @@ function writeSseError(
 
 export function createConversationTurnHandler(
   costControlService: CostControlService,
-  multimodalProvider: MultimodalProvider = createOpenAiCompatibleMultimodalProvider()
+  multimodalProvider: MultimodalProvider = createOpenAiCompatibleMultimodalProvider(),
+  modelConfigService: ModelConfigService = createModelConfigService()
 ) {
   return async function handleConversationTurn(
     request: Request,
@@ -211,7 +215,7 @@ export function createConversationTurnHandler(
       return;
     }
 
-    const modelConfig = readModelConfig(process.env);
+    const modelConfig = modelConfigService.getConfig();
 
     if (!modelConfig.ok) {
       if (modelConfig.reason === "invalid") {
@@ -249,7 +253,7 @@ export function createConversationTurnHandler(
 
     try {
       const completion = await multimodalProvider.complete({
-        config: modelConfig,
+        config: modelConfig.config,
         keyframes: validation.keyframes,
         messages: validation.request.session.messages,
         text: validation.request.text
@@ -293,7 +297,8 @@ export function createConversationTurnHandler(
 
 export function createConversationTurnStreamHandler(
   costControlService: CostControlService,
-  multimodalProvider: MultimodalProvider = createOpenAiCompatibleMultimodalProvider()
+  multimodalProvider: MultimodalProvider = createOpenAiCompatibleMultimodalProvider(),
+  modelConfigService: ModelConfigService = createModelConfigService()
 ) {
   return async function handleConversationTurnStream(
     request: Request,
@@ -375,7 +380,7 @@ export function createConversationTurnStreamHandler(
 
     writeSseStatus(response, "checking-model");
 
-    const modelConfig = readModelConfig(process.env);
+    const modelConfig = modelConfigService.getConfig();
 
     if (!modelConfig.ok) {
       if (modelConfig.reason === "invalid") {
@@ -423,7 +428,7 @@ export function createConversationTurnStreamHandler(
     try {
       const completion = await multimodalProvider.completeStream(
         {
-          config: modelConfig,
+          config: modelConfig.config,
           keyframes: validation.keyframes,
           messages: validation.request.session.messages,
           text: validation.request.text

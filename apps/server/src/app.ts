@@ -10,12 +10,17 @@ import {
 } from "./conversation-route";
 import { createZeroCost } from "./conversation-validation";
 import {
+  createModelConfigService,
+  type ModelConfigService
+} from "./model-config";
+import {
   createOpenAiCompatibleMultimodalProvider,
   type MultimodalProvider
 } from "./multimodal-provider";
 
 type CreateAppOptions = {
   costControlService?: CostControlService;
+  modelConfigService?: ModelConfigService;
   multimodalProvider?: MultimodalProvider;
 };
 
@@ -23,6 +28,8 @@ export function createApp(options: CreateAppOptions = {}) {
   const app = express();
   const costControlService =
     options.costControlService ?? createCostControlService();
+  const modelConfigService =
+    options.modelConfigService ?? createModelConfigService();
   const multimodalProvider =
     options.multimodalProvider ?? createOpenAiCompatibleMultimodalProvider();
 
@@ -34,14 +41,42 @@ export function createApp(options: CreateAppOptions = {}) {
       service: "ai-vision-voice-chat-api"
     });
   });
+  app.get("/api/model-config", (_request, response) => {
+    response.json(modelConfigService.getStatus());
+  });
+  app.put("/api/model-config", (request, response) => {
+    const result = modelConfigService.setRuntimeConfig(request.body);
+
+    if (!result.ok) {
+      response.status(400).json({
+        error: {
+          code: "MODEL_CONFIG_INVALID",
+          invalid: result.invalid,
+          message: "模型配置无效。"
+        },
+        ok: false
+      });
+      return;
+    }
+
+    response.json(result.status);
+  });
 
   app.post(
     "/api/conversation-turn",
-    createConversationTurnHandler(costControlService, multimodalProvider)
+    createConversationTurnHandler(
+      costControlService,
+      multimodalProvider,
+      modelConfigService
+    )
   );
   app.post(
     "/api/conversation-turn/stream",
-    createConversationTurnStreamHandler(costControlService, multimodalProvider)
+    createConversationTurnStreamHandler(
+      costControlService,
+      multimodalProvider,
+      modelConfigService
+    )
   );
 
   app.use(

@@ -1,4 +1,10 @@
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type UIEvent,
+  useEffect,
+  useRef,
+  useState
+} from "react";
 
 import "./App.css";
 import cameraFeedUrl from "./assets/camera-feed-reference.png";
@@ -7,13 +13,19 @@ import {
   type ConversationSessionStats,
   type ConversationTurnResponse,
   type ConversationTurnStatusPhase,
+  type ModelConfigStatus,
+  getModelConfig,
+  putModelConfig,
   streamConversationTurn
 } from "./conversation-client";
+import { type CapturedKeyframe, maxKeyframesPerTurn } from "./frame-capture";
 import {
-  type CapturedKeyframe,
-  captureCompressedKeyframe,
-  maxKeyframesPerTurn
-} from "./frame-capture";
+  type BufferedKeyframe,
+  appendBufferedKeyframe,
+  captureBufferedKeyframe,
+  defaultFrameBufferOptions,
+  toCapturedKeyframes
+} from "./frame-buffer";
 
 type BackendStatus = "checking" | "online" | "offline";
 type SessionStatus = "idle" | "starting" | "active" | "error";
@@ -38,11 +50,26 @@ type HealthResponse = {
   service: string;
 };
 
+type ModelConfigFormState = {
+  apiKey: string;
+  baseUrl: string;
+  maxOutputTokens: string;
+  modelName: string;
+  timeoutMs: string;
+};
+
 const serviceName = "ai-vision-voice-chat-api";
 const initialStats: ConversationSessionStats = {
   estimatedUsd: 0,
   keyframeCount: 0,
   requestCount: 0
+};
+const initialModelConfigForm: ModelConfigFormState = {
+  apiKey: "",
+  baseUrl: "",
+  maxOutputTokens: "512",
+  modelName: "",
+  timeoutMs: "30000"
 };
 
 function stopMediaStream(stream: MediaStream | null) {
@@ -91,15 +118,55 @@ function getSpeechRecognitionConstructor() {
   return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null;
 }
 
+function getModelConfigSourceLabel(status: ModelConfigStatus | null) {
+  if (!status) {
+    return "未读取";
+  }
+
+  if (status.source === "runtime") {
+    return "页面临时配置";
+  }
+
+  if (status.source === "env") {
+    return "环境变量配置";
+  }
+
+  if (status.source === "invalid") {
+    return "配置无效";
+  }
+
+  return "配置缺失";
+}
+
+function createFormFromModelConfigStatus(
+  status: ModelConfigStatus
+): ModelConfigFormState {
+  if (status.source === "runtime" || status.source === "env") {
+    return {
+      apiKey: "",
+      baseUrl: status.baseUrl,
+      maxOutputTokens: String(status.maxOutputTokens),
+      modelName: status.modelName,
+      timeoutMs: String(status.timeoutMs)
+    };
+  }
+
+  return initialModelConfigForm;
+}
+
 export function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const messageBottomRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const shouldStickToBottomRef = useRef(true);
   const shouldResumeListeningRef = useRef(false);
   const isRecognitionActiveRef = useRef(false);
   const isSubmittingRef = useRef(false);
   const isSpeakingRef = useRef(false);
-  const keyframesRef = useRef<CapturedKeyframe[]>([]);
+  const frameBufferIntervalRef = useRef<number | null>(null);
+  const keyframesRef = useRef<BufferedKeyframe[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const stoppedMediaStreamsRef = useRef<WeakSet<MediaStream>>(new WeakSet());
   const messagesRef = useRef<ConversationMessage[]>([]);
   const sessionIdRef = useRef<string | null>(null);
   const sessionStatsRef = useRef<ConversationSessionStats>(initialStats);
@@ -110,7 +177,7 @@ export function App() {
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
-  const [keyframes, setKeyframes] = useState<CapturedKeyframe[]>([]);
+  const [keyframes, setKeyframes] = useState<BufferedKeyframe[]>([]);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionStats, setSessionStats] =
@@ -128,6 +195,17 @@ export function App() {
   const [lastTranscript, setLastTranscript] = useState("");
   const [pendingAssistantText, setPendingAssistantText] = useState("");
   const [turnStatus, setTurnStatus] = useState<TurnStatus>("idle");
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isModelConfigSaving, setIsModelConfigSaving] = useState(false);
+  const [modelConfigForm, setModelConfigForm] = useState<ModelConfigFormState>(
+    initialModelConfigForm
+  );
+  const [modelConfigStatus, setModelConfigStatus] =
+    useState<ModelConfigStatus | null>(null);
+  const [modelConfigMessage, setModelConfigMessage] = useState<string | null>(
+    null
+  );
+  const [modelConfigError, setModelConfigError] = useState<string | null>(null);
 
   const isSessionActive = sessionStatus === "active";
   const isSpeechListening =
@@ -154,9 +232,22 @@ export function App() {
   const latencyLabel = latencyMs === null ? "--" : `${latencyMs}ms`;
   const frameCountLabel = `${keyframes.length} / ${maxKeyframesPerTurn}`;
   const modelCostLabel = formatUsd(sessionStats.estimatedUsd);
-  const speechButtonLabel = isSpeechListening
-    ? "停止语音监听"
-    : "开始语音监听";
+  const isConversationBusy =
+    sessionStatus === "starting" || isSubmitting || ttsStatus === "speaking";
+  const conversationControlLabel = isConversationBusy
+    ? "处理中"
+    : !isSessionActive
+      ? "开始对话"
+      : isSpeechListening
+        ? "暂停监听"
+        : "继续监听";
+  const conversationControlIcon = isConversationBusy
+    ? "icon-video"
+    : !isSessionActive
+      ? "icon-video"
+      : isSpeechListening
+        ? "icon-pause"
+        : "icon-play";
   const speechStatusLabel =
     speechStatus === "unsupported"
       ? "不支持语音识别"
@@ -200,10 +291,153 @@ export function App() {
                     : turnStatus === "error"
                       ? "请求失败"
                       : "等待提问";
+  const modelConfigSourceLabel = getModelConfigSourceLabel(modelConfigStatus);
+  const modelApiKeyLabel = modelConfigStatus?.hasApiKey
+    ? "已配置密钥"
+    : "未配置密钥";
 
   function setSpeechStatusState(nextStatus: SpeechStatus) {
     speechStatusRef.current = nextStatus;
     setSpeechStatus(nextStatus);
+  }
+
+  function stopTrackedMediaStream(stream: MediaStream | null) {
+    if (!stream || stoppedMediaStreamsRef.current.has(stream)) {
+      return;
+    }
+
+    stoppedMediaStreamsRef.current.add(stream);
+    stopMediaStream(stream);
+  }
+
+  function stopFrameBuffering() {
+    if (frameBufferIntervalRef.current === null) {
+      return;
+    }
+
+    window.clearInterval(frameBufferIntervalRef.current);
+    frameBufferIntervalRef.current = null;
+  }
+
+  function setKeyframeBuffer(nextKeyframes: BufferedKeyframe[]) {
+    keyframesRef.current = nextKeyframes;
+    setKeyframes(nextKeyframes);
+  }
+
+  function appendKeyframeToBuffer(
+    keyframe: BufferedKeyframe,
+    options: { force?: boolean } = {}
+  ) {
+    if (options.force) {
+      setKeyframeBuffer(
+        [...keyframesRef.current, keyframe].slice(
+          -defaultFrameBufferOptions.maxFrames
+        )
+      );
+      return;
+    }
+
+    const update = appendBufferedKeyframe(keyframesRef.current, keyframe);
+
+    if (update.accepted) {
+      setKeyframeBuffer(update.frames);
+    }
+  }
+
+  function sampleBufferedFrame() {
+    if (
+      sessionStatusRef.current !== "active" ||
+      mediaStreamRef.current === null
+    ) {
+      return;
+    }
+
+    const video = videoRef.current;
+
+    if (!video) {
+      return;
+    }
+
+    try {
+      appendKeyframeToBuffer(
+        captureBufferedKeyframe(video, {
+          id: `frame-${Date.now()}-${keyframesRef.current.length + 1}`
+        })
+      );
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  }
+
+  function openSettings() {
+    setIsSettingsOpen(true);
+    setModelConfigError(null);
+    setModelConfigMessage(null);
+  }
+
+  function updateModelConfigField(
+    field: keyof ModelConfigFormState,
+    value: string
+  ) {
+    setModelConfigForm((currentForm) => ({
+      ...currentForm,
+      [field]: value
+    }));
+    setModelConfigError(null);
+    setModelConfigMessage(null);
+  }
+
+  function handleChatScroll(event: UIEvent<HTMLDivElement>) {
+    const element = event.currentTarget;
+    const distanceFromBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight;
+
+    shouldStickToBottomRef.current = distanceFromBottom < 80;
+  }
+
+  async function saveModelConfig(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsModelConfigSaving(true);
+    setModelConfigError(null);
+    setModelConfigMessage(null);
+
+    const timeoutMs = Number(modelConfigForm.timeoutMs);
+    const maxOutputTokens = Number(modelConfigForm.maxOutputTokens);
+
+    if (
+      !Number.isFinite(timeoutMs) ||
+      timeoutMs <= 0 ||
+      !Number.isFinite(maxOutputTokens) ||
+      maxOutputTokens <= 0
+    ) {
+      setIsModelConfigSaving(false);
+      setModelConfigError("MODEL_CONFIG_INVALID：模型配置无效。");
+      return;
+    }
+
+    try {
+      const status = await putModelConfig({
+        apiKey: modelConfigForm.apiKey,
+        baseUrl: modelConfigForm.baseUrl,
+        maxOutputTokens,
+        modelName: modelConfigForm.modelName,
+        timeoutMs
+      });
+
+      setModelConfigStatus(status);
+      setModelConfigForm({
+        apiKey: "",
+        baseUrl: status.baseUrl,
+        maxOutputTokens: String(status.maxOutputTokens),
+        modelName: status.modelName,
+        timeoutMs: String(status.timeoutMs)
+      });
+      setModelConfigMessage("模型配置已保存");
+    } catch (error) {
+      setModelConfigError(getErrorMessage(error));
+    } finally {
+      setIsModelConfigSaving(false);
+    }
   }
 
   useEffect(() => {
@@ -239,10 +473,73 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!isSettingsOpen) {
+      return;
+    }
+
+    let isMounted = true;
+
+    async function loadModelConfig() {
+      try {
+        const status = await getModelConfig();
+
+        if (!isMounted) {
+          return;
+        }
+
+        setModelConfigStatus(status);
+        setModelConfigForm(createFormFromModelConfigStatus(status));
+        setModelConfigError(null);
+      } catch (error) {
+        if (isMounted) {
+          setModelConfigError(getErrorMessage(error));
+        }
+      }
+    }
+
+    void loadModelConfig();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [isSettingsOpen]);
+
+  useEffect(() => {
     if (videoRef.current) {
       videoRef.current.srcObject = mediaStream;
     }
   }, [mediaStream]);
+
+  useEffect(() => {
+    if (sessionStatus !== "active" || mediaStream === null) {
+      stopFrameBuffering();
+      return;
+    }
+
+    stopFrameBuffering();
+    frameBufferIntervalRef.current = window.setInterval(
+      sampleBufferedFrame,
+      defaultFrameBufferOptions.sampleIntervalMs
+    );
+
+    return () => {
+      stopFrameBuffering();
+    };
+  }, [mediaStream, sessionStatus]);
+
+  useEffect(() => {
+    if (!shouldStickToBottomRef.current) {
+      return;
+    }
+
+    const scrollIntoView = messageBottomRef.current?.scrollIntoView;
+
+    if (typeof scrollIntoView === "function") {
+      scrollIntoView.call(messageBottomRef.current, {
+        block: "end"
+      });
+    }
+  }, [messages, pendingAssistantText]);
 
   useEffect(() => {
     keyframesRef.current = keyframes;
@@ -270,43 +567,58 @@ export function App() {
 
   useEffect(() => {
     return () => {
-      stopMediaStream(mediaStream);
+      stopTrackedMediaStream(mediaStream);
     };
   }, [mediaStream]);
 
   useEffect(() => {
     return () => {
+      stopFrameBuffering();
       stopVoiceRecognition({ clearAutoResume: true });
       window.speechSynthesis?.cancel();
     };
   }, []);
 
-  async function startSession() {
+  async function startSession({
+    startListening = false
+  }: {
+    startListening?: boolean;
+  } = {}) {
     setErrorMessage(null);
     setErrorCloudCallLabel(null);
 
     if (!navigator.mediaDevices?.getUserMedia) {
+      sessionStatusRef.current = "error";
       setSessionStatus("error");
       setErrorMessage("当前浏览器不支持摄像头访问。");
       return;
     }
 
+    sessionStatusRef.current = "starting";
     setSessionStatus("starting");
 
     try {
-      stopMediaStream(mediaStream);
+      stopFrameBuffering();
+      stopTrackedMediaStream(mediaStreamRef.current ?? mediaStream);
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: true
       });
+      const nextSessionId = createSessionId();
 
+      mediaStreamRef.current = stream;
+      keyframesRef.current = [];
+      messagesRef.current = [];
+      sessionStatsRef.current = initialStats;
+      sessionIdRef.current = nextSessionId;
+      sessionStatusRef.current = "active";
       setMediaStream(stream);
       setKeyframes([]);
       setMessages([]);
       setPromptText("");
       setSessionStats(initialStats);
-      setSessionId(createSessionId());
+      setSessionId(nextSessionId);
       setSessionStartedAt(new Date());
       setSessionStatus("active");
       setSpeechStatusState("idle");
@@ -316,7 +628,14 @@ export function App() {
       setLastTranscript("");
       setPendingAssistantText("");
       shouldResumeListeningRef.current = false;
+
+      if (startListening) {
+        startVoiceListening();
+      }
     } catch (error) {
+      mediaStreamRef.current = null;
+      sessionIdRef.current = null;
+      sessionStatusRef.current = "error";
       setMediaStream(null);
       setSessionId(null);
       setSessionStartedAt(null);
@@ -327,9 +646,16 @@ export function App() {
 
   function stopSession() {
     stopVoiceRecognition({ clearAutoResume: true });
+    stopFrameBuffering();
     window.speechSynthesis?.cancel();
     isSpeakingRef.current = false;
-    stopMediaStream(mediaStream);
+    stopTrackedMediaStream(mediaStreamRef.current ?? mediaStream);
+    mediaStreamRef.current = null;
+    keyframesRef.current = [];
+    messagesRef.current = [];
+    sessionStatsRef.current = initialStats;
+    sessionIdRef.current = null;
+    sessionStatusRef.current = "idle";
     setMediaStream(null);
     setKeyframes([]);
     setMessages([]);
@@ -362,7 +688,7 @@ export function App() {
       throw new Error("实时视频尚未挂载，请稍后再试。");
     }
 
-    return captureCompressedKeyframe(video, {
+    return captureBufferedKeyframe(video, {
       id: `frame-${Date.now()}-${frameIndex + 1}`
     });
   }
@@ -525,6 +851,23 @@ export function App() {
     startVoiceListening();
   }
 
+  async function handleConversationToggle() {
+    if (
+      sessionStatusRef.current === "starting" ||
+      isSubmittingRef.current ||
+      isSpeakingRef.current
+    ) {
+      return;
+    }
+
+    if (sessionStatusRef.current !== "active") {
+      await startSession({ startListening: true });
+      return;
+    }
+
+    toggleVoiceListening();
+  }
+
   function resumeListeningAfterSpeech() {
     isSpeakingRef.current = false;
 
@@ -595,17 +938,12 @@ export function App() {
   }
 
   function captureKeyframe() {
-    if (keyframes.length >= maxKeyframesPerTurn) {
-      setErrorMessage(`每轮最多保留 ${maxKeyframesPerTurn} 张关键帧。`);
-      return;
-    }
-
     try {
       const keyframe = captureFrame(keyframes.length);
 
       setErrorMessage(null);
       setErrorCloudCallLabel(null);
-      setKeyframes((currentKeyframes) => [...currentKeyframes, keyframe]);
+      appendKeyframeToBuffer(keyframe, { force: true });
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
     }
@@ -637,14 +975,15 @@ export function App() {
       return;
     }
 
-    let requestKeyframes = keyframesRef.current;
+    let requestKeyframes = toCapturedKeyframes(keyframesRef.current);
 
     if (requestKeyframes.length === 0) {
       try {
         setTurnStatus("capturing-frame");
-        requestKeyframes = [captureFrame(0)];
-        keyframesRef.current = requestKeyframes;
-        setKeyframes(requestKeyframes);
+        const fallbackKeyframe = captureFrame(0);
+        const nextKeyframes = [fallbackKeyframe];
+        requestKeyframes = toCapturedKeyframes(nextKeyframes);
+        setKeyframeBuffer(nextKeyframes);
       } catch (error) {
         setErrorMessage(getErrorMessage(error));
         if (source === "voice") {
@@ -673,6 +1012,7 @@ export function App() {
     }
 
     isSubmittingRef.current = true;
+    shouldStickToBottomRef.current = true;
     setIsSubmitting(true);
     setErrorMessage(null);
     setErrorCloudCallLabel(null);
@@ -736,8 +1076,7 @@ export function App() {
       messagesRef.current = nextMessages;
       setMessages(nextMessages);
       setPromptText("");
-      keyframesRef.current = [];
-      setKeyframes([]);
+      setKeyframeBuffer([]);
       setPendingAssistantText("");
       setTurnStatus("completed");
       speakAssistantReply(response.reply.text);
@@ -772,7 +1111,12 @@ export function App() {
             <span className="status-dot" aria-hidden="true" />
             <span>{backendStatusLabel}</span>
           </div>
-          <button className="icon-button" type="button" aria-label="设置">
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="设置"
+            onClick={openSettings}
+          >
             <span className="icon-gear" aria-hidden="true" />
           </button>
           <button className="avatar-button" type="button" aria-label="用户">
@@ -780,6 +1124,126 @@ export function App() {
           </button>
         </div>
       </header>
+
+      {isSettingsOpen ? (
+        <div className="settings-backdrop">
+          <section
+            className="settings-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="model-config-title"
+          >
+            <div className="settings-header">
+              <div>
+                <p className="settings-kicker">运行时模型</p>
+                <h2 id="model-config-title">模型配置</h2>
+              </div>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="关闭模型配置"
+                onClick={() => setIsSettingsOpen(false)}
+              >
+                <span className="icon-close" aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="model-config-status" aria-label="模型配置状态">
+              <div>
+                <span>来源</span>
+                <strong>{modelConfigSourceLabel}</strong>
+              </div>
+              <div>
+                <span>密钥</span>
+                <strong>{modelApiKeyLabel}</strong>
+              </div>
+            </div>
+
+            <form className="settings-form" onSubmit={saveModelConfig}>
+              <label>
+                <span>模型服务地址</span>
+                <input
+                  autoComplete="off"
+                  value={modelConfigForm.baseUrl}
+                  onChange={(event) =>
+                    updateModelConfigField("baseUrl", event.target.value)
+                  }
+                  placeholder="https://your-openai-compatible-host/v1"
+                />
+              </label>
+              <label>
+                <span>模型名称</span>
+                <input
+                  autoComplete="off"
+                  value={modelConfigForm.modelName}
+                  onChange={(event) =>
+                    updateModelConfigField("modelName", event.target.value)
+                  }
+                  placeholder="vision-model"
+                />
+              </label>
+              <label>
+                <span>API Key</span>
+                <input
+                  autoComplete="off"
+                  type="password"
+                  value={modelConfigForm.apiKey}
+                  onChange={(event) =>
+                    updateModelConfigField("apiKey", event.target.value)
+                  }
+                  placeholder="仅提交到同源后端内存"
+                />
+              </label>
+              <div className="settings-number-row">
+                <label>
+                  <span>超时时间（毫秒）</span>
+                  <input
+                    min="1"
+                    type="number"
+                    value={modelConfigForm.timeoutMs}
+                    onChange={(event) =>
+                      updateModelConfigField("timeoutMs", event.target.value)
+                    }
+                  />
+                </label>
+                <label>
+                  <span>最大输出 Token</span>
+                  <input
+                    min="1"
+                    type="number"
+                    value={modelConfigForm.maxOutputTokens}
+                    onChange={(event) =>
+                      updateModelConfigField(
+                        "maxOutputTokens",
+                        event.target.value
+                      )
+                    }
+                  />
+                </label>
+              </div>
+
+              {modelConfigMessage ? (
+                <div className="settings-success" role="status">
+                  {modelConfigMessage}
+                </div>
+              ) : null}
+              {modelConfigError ? (
+                <div className="settings-error" role="alert">
+                  {modelConfigError}
+                </div>
+              ) : null}
+
+              <button
+                className="settings-save-button"
+                disabled={isModelConfigSaving}
+                type="submit"
+              >
+                {isModelConfigSaving ? "保存中" : "保存模型配置"}
+              </button>
+            </form>
+          </section>
+        </div>
+      ) : null}
 
       <main className="workspace" aria-label="AI 视觉语音桌面工作台">
         <section className="vision-panel" aria-label="摄像头画面">
@@ -826,7 +1290,13 @@ export function App() {
         </section>
 
         <section className="chat-panel" aria-label="语音与文本对话">
-          <div className="chat-scroll">
+          <div
+            className="chat-scroll"
+            role="log"
+            aria-label="对话消息"
+            aria-relevant="additions text"
+            onScroll={handleChatScroll}
+          >
             <div className="session-chip">当前会话</div>
 
             {isSessionActive ? (
@@ -837,7 +1307,7 @@ export function App() {
                       <span className="icon-memory" />
                     </div>
                     <div className="message-bubble assistant-bubble">
-                      <p>摄像头已连接，可以点击麦克风提问，也可以输入文本验证视觉链路。</p>
+                      <p>摄像头已连接，可以直接说话提问，也可以输入文本验证视觉链路。</p>
                       <div className="keyframe-strip" aria-label="关键帧预览">
                         {keyframes.length > 0 ? (
                           keyframes.map((keyframe, index) => (
@@ -923,23 +1393,38 @@ export function App() {
                 {errorCloudCallLabel ? <strong>{errorCloudCallLabel}</strong> : null}
               </div>
             ) : null}
+            <div
+              className="message-bottom-sentinel"
+              ref={messageBottomRef}
+              aria-hidden="true"
+            />
           </div>
 
           <footer className="control-dock">
             <div className="voice-status-panel" aria-label="语音状态">
-              <div>
+              <div className="voice-status-item">
                 <span>监听</span>
                 <strong>{speechStatusLabel}</strong>
               </div>
-              <div>
+              <div className="voice-status-item">
                 <span>转写</span>
                 <strong>{transcriptPreview}</strong>
               </div>
-              <div>
+              <div className="voice-status-item status-with-action">
                 <span>播报</span>
                 <strong>{ttsStatusLabel}</strong>
+                {ttsStatus === "speaking" ? (
+                  <button
+                    className="status-action-button"
+                    type="button"
+                    aria-label="停止播报"
+                    onClick={stopSpeaking}
+                  >
+                    停止播报
+                  </button>
+                ) : null}
               </div>
-              <div>
+              <div className="voice-status-item">
                 <span>模型</span>
                 <strong>{turnStatusLabel}</strong>
               </div>
@@ -966,9 +1451,9 @@ export function App() {
               </button>
             </form>
 
-            <div className="control-buttons">
+            <div className="control-buttons" aria-label="对话控制">
               <button
-                className="round-button ghost-button"
+                className="round-button utility-button"
                 type="button"
                 aria-label="截取关键帧"
                 onClick={captureKeyframe}
@@ -976,41 +1461,23 @@ export function App() {
                 <span className="icon-camera" aria-hidden="true" />
               </button>
               <button
-                className="round-button mic-button"
+                className={`round-button conversation-button ${
+                  isSpeechListening ? "listening" : ""
+                }`}
                 type="button"
-                aria-label={speechButtonLabel}
-                disabled={
-                  !isSessionActive || isSubmitting || ttsStatus === "speaking"
-                }
-                onClick={toggleVoiceListening}
+                aria-label={conversationControlLabel}
+                disabled={isConversationBusy}
+                onClick={handleConversationToggle}
               >
-                <span className="icon-mic" aria-hidden="true" />
+                <span className={conversationControlIcon} aria-hidden="true" />
               </button>
               <button
-                className="round-button camera-button"
+                className="round-button end-call-button"
                 type="button"
-                aria-label={sessionStatus === "starting" ? "启动中" : "开始摄像头"}
-                disabled={sessionStatus === "starting"}
-                onClick={startSession}
-              >
-                <span className="icon-video" aria-hidden="true" />
-              </button>
-              <button
-                className="round-button ghost-button"
-                type="button"
-                aria-label="停止播报"
-                disabled={ttsStatus !== "speaking"}
-                onClick={stopSpeaking}
-              >
-                <span className="icon-stop" aria-hidden="true" />
-              </button>
-              <button
-                className="round-button ghost-button danger-button"
-                type="button"
-                aria-label="停止会话"
+                aria-label="结束对话"
                 onClick={stopSession}
               >
-                <span className="icon-stop" aria-hidden="true" />
+                <span className="icon-x" aria-hidden="true" />
               </button>
             </div>
 
@@ -1020,7 +1487,7 @@ export function App() {
                 <dd>{latencyLabel}</dd>
               </div>
               <div>
-                <dt>Frames:</dt>
+                <dt>Buffer:</dt>
                 <dd>{frameCountLabel}</dd>
               </div>
               <div>

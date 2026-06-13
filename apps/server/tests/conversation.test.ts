@@ -196,6 +196,39 @@ async function postConversationTurnStream(body: unknown, app = createApp()) {
   };
 }
 
+function putRuntimeModelConfig(app = createApp()) {
+  const request = createRequest({
+    body: {
+      apiKey: "runtime-test-key",
+      baseUrl: "https://runtime-model.example.test/v1",
+      maxOutputTokens: 256,
+      modelName: "runtime-vision-model",
+      timeoutMs: 15000
+    },
+    headers: {
+      "content-type": "application/json"
+    },
+    method: "PUT",
+    url: "/api/model-config"
+  });
+  const response = createResponse();
+
+  app.use((_request, fallbackResponse) => {
+    fallbackResponse.status(404).json({
+      error: {
+        code: "NOT_FOUND"
+      },
+      ok: false
+    });
+  });
+  app.handle(request, response);
+
+  expect(response._getStatusCode()).toBe(200);
+  expect(response._getJSONData()).not.toHaveProperty("apiKey");
+
+  return response._getJSONData();
+}
+
 function parseSseEvents(rawBody: string) {
   return rawBody
     .trim()
@@ -418,6 +451,32 @@ describe("POST /api/conversation-turn", () => {
       ok: false
     });
     expect(fake.calls).toHaveLength(0);
+  });
+
+  it("uses runtime model config for non-streaming conversation requests", async () => {
+    const fake = createFakeMultimodalProvider();
+    const app = createApp({ multimodalProvider: fake.provider });
+
+    putRuntimeModelConfig(app);
+
+    const response = await postConversationTurn(validRequestBody(), app);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      model: {
+        name: "runtime-vision-model",
+        provider: "openai-compatible"
+      },
+      ok: true
+    });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].config).toEqual({
+      apiKey: "runtime-test-key",
+      baseUrl: "https://runtime-model.example.test/v1",
+      maxOutputTokens: 256,
+      modelName: "runtime-vision-model",
+      timeoutMs: 15000
+    });
   });
 
   it("returns a successful assistant reply from the configured provider", async () => {
@@ -672,6 +731,41 @@ describe("POST /api/conversation-turn", () => {
         role: "assistant",
         text: "我看到桌面上的杯子。"
       }
+    });
+  });
+
+  it("uses runtime model config for streaming conversation requests", async () => {
+    const fake = createFakeMultimodalProvider({
+      streamDeltas: ["运行时", "配置生效。"]
+    });
+    const app = createApp({ multimodalProvider: fake.provider });
+
+    putRuntimeModelConfig(app);
+
+    const response = await postConversationTurnStream(validRequestBody(), app);
+    const events = parseSseEvents(response.body);
+
+    expect(response.status).toBe(200);
+    expect(events.at(-1)).toMatchObject({
+      data: {
+        model: {
+          name: "runtime-vision-model",
+          provider: "openai-compatible"
+        },
+        ok: true,
+        reply: {
+          text: "运行时配置生效。"
+        }
+      },
+      event: "complete"
+    });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].config).toEqual({
+      apiKey: "runtime-test-key",
+      baseUrl: "https://runtime-model.example.test/v1",
+      maxOutputTokens: 256,
+      modelName: "runtime-vision-model",
+      timeoutMs: 15000
     });
   });
 

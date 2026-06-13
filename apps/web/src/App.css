@@ -10,6 +10,11 @@
   box-sizing: border-box;
 }
 
+html,
+#root {
+  height: 100%;
+}
+
 body {
   margin: 0;
   min-width: 320px;
@@ -26,14 +31,17 @@ button {
 
 .workbench {
   display: flex;
+  height: 100vh;
   min-height: 100vh;
   flex-direction: column;
+  overflow: hidden;
   background: #0b0c0e;
   color: #e2e2e6;
 }
 
 .top-bar {
   display: flex;
+  flex: 0 0 auto;
   width: 100%;
   align-items: center;
   justify-content: space-between;
@@ -41,6 +49,190 @@ button {
   background: rgb(17 19 22 / 82%);
   padding: 14px 32px;
   backdrop-filter: blur(18px);
+}
+
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: start end;
+  background: rgb(0 0 0 / 46%);
+  padding: 76px 32px 32px;
+}
+
+.settings-dialog {
+  width: min(100%, 430px);
+  max-height: calc(100vh - 108px);
+  overflow-y: auto;
+  border: 1px solid rgb(144 143 161 / 34%);
+  border-radius: 8px;
+  background: #1e2228;
+  box-shadow: 0 28px 70px rgb(0 0 0 / 56%);
+  padding: 20px;
+}
+
+.settings-header,
+.model-config-status,
+.settings-number-row {
+  display: flex;
+  gap: 12px;
+}
+
+.settings-header {
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.settings-kicker {
+  margin: 0 0 5px;
+  color: #8ff8ff;
+  font-size: 0.68rem;
+  font-weight: 900;
+}
+
+.settings-header h2 {
+  margin: 0;
+  color: #f4feff;
+  font-size: 1.08rem;
+  line-height: 1.2;
+}
+
+.icon-close {
+  position: relative;
+  width: 16px;
+  height: 16px;
+}
+
+.icon-close::before,
+.icon-close::after {
+  position: absolute;
+  top: 7px;
+  left: 1px;
+  width: 14px;
+  height: 2px;
+  border-radius: 999px;
+  background: currentColor;
+  content: "";
+}
+
+.icon-close::before {
+  transform: rotate(45deg);
+}
+
+.icon-close::after {
+  transform: rotate(-45deg);
+}
+
+.model-config-status {
+  margin-bottom: 16px;
+}
+
+.model-config-status div {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid rgb(70 69 86 / 38%);
+  border-radius: 6px;
+  background: rgb(17 19 22 / 54%);
+  padding: 9px 10px;
+}
+
+.model-config-status span,
+.settings-form label > span {
+  display: block;
+  color: rgb(199 196 216 / 70%);
+  font-size: 0.7rem;
+  font-weight: 900;
+}
+
+.model-config-status span {
+  margin-bottom: 5px;
+}
+
+.model-config-status strong {
+  display: block;
+  overflow: hidden;
+  color: #e2e2e6;
+  font-size: 0.82rem;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-form {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-form label {
+  display: grid;
+  gap: 7px;
+}
+
+.settings-form input {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid rgb(70 69 86 / 48%);
+  border-radius: 6px;
+  outline: none;
+  background: rgb(17 19 22 / 70%);
+  color: #e2e2e6;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 0.86rem;
+}
+
+.settings-form input:focus {
+  border-color: rgb(193 193 255 / 58%);
+  box-shadow: 0 0 0 3px rgb(193 193 255 / 9%);
+}
+
+.settings-number-row label {
+  min-width: 0;
+  flex: 1;
+}
+
+.settings-success,
+.settings-error {
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 0.8rem;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.settings-success {
+  border: 1px solid rgb(16 185 129 / 32%);
+  background: rgb(16 185 129 / 10%);
+  color: #a7f3d0;
+}
+
+.settings-error {
+  border: 1px solid rgb(239 68 68 / 30%);
+  background: rgb(239 68 68 / 10%);
+  color: #fecaca;
+}
+
+.settings-save-button {
+  min-height: 42px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: #00a3ad;
+  color: #f4feff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 900;
+}
+
+.settings-save-button:hover:not(:disabled) {
+  background: #00bac5;
+}
+
+.settings-save-button:disabled {
+  cursor: wait;
+  opacity: 0.64;
 }
 
 .brand,
@@ -203,6 +395,7 @@ button {
 .workspace {
   display: grid;
   width: min(100%, 1440px);
+  height: 0;
   min-height: 0;
   flex: 1;
   grid-template-columns: minmax(0, 3fr) minmax(360px, 2fr);
@@ -214,6 +407,7 @@ button {
 .vision-panel,
 .chat-panel {
   min-height: 0;
+  max-height: 100%;
   overflow: hidden;
   border: 1px solid rgb(70 69 86 / 40%);
   border-radius: 8px;
@@ -424,7 +618,9 @@ button {
   flex-direction: column;
   gap: 24px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 24px;
+  scrollbar-gutter: stable;
   background: linear-gradient(180deg, transparent, rgb(30 32 35 / 50%));
 }
 
@@ -475,6 +671,12 @@ button {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.message-bottom-sentinel {
+  width: 100%;
+  height: 1px;
+  flex: 0 0 1px;
 }
 
 .user-message {
@@ -679,6 +881,7 @@ button {
 }
 
 .control-dock {
+  flex: 0 0 auto;
   border-top: 1px solid rgb(70 69 86 / 32%);
   background: #1e2023;
   padding: 20px;
@@ -715,6 +918,39 @@ button {
   line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.status-with-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 8px;
+}
+
+.status-with-action span {
+  grid-column: 1 / -1;
+}
+
+.status-action-button {
+  border: 1px solid rgb(245 245 247 / 18%);
+  border-radius: 999px;
+  background: rgb(245 245 247 / 8%);
+  color: #f5f5f7;
+  cursor: pointer;
+  padding: 5px 9px;
+  font-size: 0.72rem;
+  font-weight: 900;
+  white-space: nowrap;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+.status-action-button:hover {
+  border-color: rgb(245 245 247 / 36%);
+  background: rgb(245 245 247 / 14%);
+  transform: translateY(-1px);
 }
 
 .prompt-form {
@@ -785,15 +1021,28 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 24px;
+  width: max-content;
+  max-width: 100%;
+  margin: 4px auto 0;
+  border: 1px solid rgb(245 245 247 / 12%);
+  border-radius: 999px;
+  background: rgb(7 8 12 / 72%);
+  box-shadow:
+    0 18px 42px rgb(0 0 0 / 32%),
+    inset 0 1px 0 rgb(255 255 255 / 8%);
+  gap: 22px;
+  padding: 12px 18px;
+  backdrop-filter: blur(18px);
 }
 
 .round-button {
   display: grid;
   place-items: center;
+  border: 1px solid transparent;
   border-radius: 50%;
   color: #e2e2e6;
   cursor: pointer;
+  flex: 0 0 auto;
   transition:
     border-color 160ms ease,
     background 160ms ease,
@@ -808,45 +1057,64 @@ button {
   transform: none;
 }
 
-.ghost-button {
-  width: 48px;
-  height: 48px;
-  border: 1px solid #464556;
-  background: transparent;
+.utility-button,
+.end-call-button {
+  width: 58px;
+  height: 58px;
+  border-color: rgb(245 245 247 / 14%);
+  background: rgb(139 139 148 / 72%);
+  color: #f9fafb;
 }
 
-.ghost-button:hover {
-  border-color: #c1c1ff;
-  background: rgb(193 193 255 / 10%);
-  color: #c1c1ff;
+.utility-button:hover {
+  border-color: rgb(245 245 247 / 28%);
+  background: rgb(164 164 172 / 82%);
+  box-shadow: 0 10px 24px rgb(0 0 0 / 22%);
+  transform: translateY(-1px);
 }
 
-.mic-button,
-.camera-button {
-  width: 64px;
-  height: 64px;
-  border: 1px solid transparent;
-  background: #5d5cff;
-  color: #fdf9ff;
-  box-shadow: 0 0 28px rgb(93 92 255 / 44%);
+.conversation-button {
+  width: 70px;
+  height: 70px;
+  background: #f8f8f9;
+  color: #111317;
+  box-shadow:
+    0 14px 32px rgb(0 0 0 / 30%),
+    inset 0 -1px 0 rgb(0 0 0 / 10%);
 }
 
-.mic-button:hover,
-.camera-button:hover {
-  box-shadow: 0 0 34px rgb(93 92 255 / 62%);
-  transform: translateY(-1px) scale(1.03);
+.conversation-button:hover:not(:disabled) {
+  background: #ffffff;
+  box-shadow:
+    0 18px 38px rgb(0 0 0 / 34%),
+    inset 0 -1px 0 rgb(0 0 0 / 12%);
+  transform: translateY(-1px) scale(1.02);
 }
 
-.danger-button:hover {
-  border-color: #ef4444;
-  background: rgb(239 68 68 / 10%);
-  color: #ef4444;
+.conversation-button.listening {
+  color: #0f1115;
+}
+
+.end-call-button {
+  background: rgb(168 164 188 / 82%);
+  color: #ff102b;
+}
+
+.end-call-button:hover {
+  border-color: rgb(255 16 43 / 32%);
+  background: rgb(188 184 206 / 88%);
+  box-shadow: 0 10px 24px rgb(255 16 43 / 12%);
+  color: #ff102b;
+  transform: translateY(-1px);
 }
 
 .icon-camera,
 .icon-video,
 .icon-mic,
+.icon-pause,
+.icon-play,
 .icon-stop,
+.icon-x,
 .icon-send {
   position: relative;
   display: block;
@@ -960,6 +1228,64 @@ button {
   background: currentColor;
 }
 
+.icon-pause {
+  width: 18px;
+  height: 24px;
+}
+
+.icon-pause::before,
+.icon-pause::after {
+  position: absolute;
+  top: 0;
+  width: 6px;
+  height: 24px;
+  border-radius: 999px;
+  background: currentColor;
+  content: "";
+}
+
+.icon-pause::before {
+  left: 0;
+}
+
+.icon-pause::after {
+  right: 0;
+}
+
+.icon-play {
+  width: 0;
+  height: 0;
+  border-top: 13px solid transparent;
+  border-bottom: 13px solid transparent;
+  border-left: 20px solid currentColor;
+  margin-left: 4px;
+}
+
+.icon-x {
+  width: 30px;
+  height: 30px;
+}
+
+.icon-x::before,
+.icon-x::after {
+  position: absolute;
+  top: 13px;
+  left: 1px;
+  width: 29px;
+  height: 4px;
+  border-radius: 999px;
+  background: currentColor;
+  content: "";
+}
+
+.icon-x::before {
+  transform: rotate(45deg);
+}
+
+.icon-x::after {
+  transform: rotate(-45deg);
+}
+
 .debug-stats {
   display: flex;
   justify-content: space-between;
@@ -1014,6 +1340,20 @@ button {
     display: none;
   }
 
+  .settings-backdrop {
+    padding: 64px 12px 12px;
+    place-items: start stretch;
+  }
+
+  .settings-dialog {
+    max-height: calc(100vh - 76px);
+  }
+
+  .model-config-status,
+  .settings-number-row {
+    flex-direction: column;
+  }
+
   .workspace {
     gap: 16px;
     padding: 12px;
@@ -1035,5 +1375,22 @@ button {
 
   .voice-status-panel {
     grid-template-columns: 1fr;
+  }
+
+  .control-buttons {
+    width: 100%;
+    gap: 16px;
+    padding: 10px 12px;
+  }
+
+  .utility-button,
+  .end-call-button {
+    width: 52px;
+    height: 52px;
+  }
+
+  .conversation-button {
+    width: 64px;
+    height: 64px;
   }
 }

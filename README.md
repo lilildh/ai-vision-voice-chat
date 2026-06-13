@@ -52,6 +52,8 @@ export MODEL_TIMEOUT_MS=30000
 export MODEL_MAX_OUTPUT_TOKENS=512
 ```
 
+也可以在页面右上角“设置”中提交模型配置。页面配置会写入同源后端的进程内存，并优先于 `MODEL_*` 环境变量用于后续请求；API Key 不会返回给前端，也不会写入浏览器本地存储。重启后端后，这份页面临时配置会清空。
+
 可选成本估算配置：
 
 ```bash
@@ -82,6 +84,8 @@ npm run build
 
 ```text
 GET /api/health
+GET /api/model-config
+PUT /api/model-config
 POST /api/conversation-turn
 POST /api/conversation-turn/stream
 ```
