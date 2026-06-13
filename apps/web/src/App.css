@@ -666,6 +666,39 @@ button {
   padding: 20px;
 }
 
+.voice-status-panel {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.voice-status-panel div {
+  min-width: 0;
+  border: 1px solid rgb(70 69 86 / 38%);
+  border-radius: 6px;
+  background: rgb(17 19 22 / 44%);
+  padding: 9px 10px;
+}
+
+.voice-status-panel span {
+  display: block;
+  margin-bottom: 5px;
+  color: rgb(199 196 216 / 68%);
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
+.voice-status-panel strong {
+  display: block;
+  overflow: hidden;
+  color: #e2e2e6;
+  font-size: 0.78rem;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .prompt-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -980,5 +1013,9 @@ button {
   .debug-stats {
     flex-direction: column;
     gap: 8px;
+  }
+
+  .voice-status-panel {
+    grid-template-columns: 1fr;
   }
 }

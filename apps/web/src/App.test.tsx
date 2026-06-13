@@ -47,6 +47,76 @@ const successResponse: MockConversationResponse = {
   }
 };
 
+type MockRecognitionResultInput = {
+  isFinal: boolean;
+  transcript: string;
+};
+
+class MockSpeechRecognition {
+  static instances: MockSpeechRecognition[] = [];
+
+  continuous = true;
+  interimResults = false;
+  lang = "";
+  maxAlternatives = 0;
+  onend: ((event: Event) => void) | null = null;
+  onerror: ((event: { error: string }) => void) | null = null;
+  onresult: ((event: {
+    resultIndex: number;
+    results: Array<{
+      0: { confidence: number; transcript: string };
+      isFinal: boolean;
+      length: number;
+    }>;
+  }) => void) | null = null;
+  onstart: ((event: Event) => void) | null = null;
+  start = vi.fn(() => {
+    this.onstart?.(new Event("start"));
+  });
+  stop = vi.fn(() => {
+    this.onend?.(new Event("end"));
+  });
+  abort = vi.fn();
+
+  constructor() {
+    MockSpeechRecognition.instances.push(this);
+  }
+
+  emitResult(results: MockRecognitionResultInput[]) {
+    this.onresult?.({
+      resultIndex: 0,
+      results: results.map((result) => ({
+        0: {
+          confidence: 0.92,
+          transcript: result.transcript
+        },
+        isFinal: result.isFinal,
+        length: 1
+      }))
+    });
+  }
+
+  emitError(error: string) {
+    this.onerror?.({ error });
+  }
+}
+
+class MockSpeechSynthesisUtterance {
+  static instances: MockSpeechSynthesisUtterance[] = [];
+
+  lang = "";
+  onend: ((event: Event) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  onstart: ((event: Event) => void) | null = null;
+  rate = 1;
+  text: string;
+
+  constructor(text = "") {
+    this.text = text;
+    MockSpeechSynthesisUtterance.instances.push(this);
+  }
+}
+
 function mockApi(conversationResponse = successResponse) {
   const fetchMock = vi.fn(async (url: string | URL | Request) => {
     const requestUrl = typeof url === "string" ? url : url.toString();
@@ -93,6 +163,32 @@ function mockMediaSession() {
     mediaStream,
     stop
   };
+}
+
+function mockSpeechRecognition() {
+  MockSpeechRecognition.instances = [];
+  vi.stubGlobal("SpeechRecognition", MockSpeechRecognition);
+  vi.stubGlobal("webkitSpeechRecognition", MockSpeechRecognition);
+
+  return MockSpeechRecognition;
+}
+
+function mockSpeechSynthesis() {
+  MockSpeechSynthesisUtterance.instances = [];
+  const speechSynthesisMock = {
+    cancel: vi.fn(),
+    speak: vi.fn((utterance: MockSpeechSynthesisUtterance) => {
+      utterance.onstart?.(new Event("start"));
+    })
+  };
+
+  vi.stubGlobal("SpeechSynthesisUtterance", MockSpeechSynthesisUtterance);
+  Object.defineProperty(window, "speechSynthesis", {
+    configurable: true,
+    value: speechSynthesisMock
+  });
+
+  return speechSynthesisMock;
 }
 
 function mockCanvas(dataUrl = "data:image/jpeg;base64,aW1hZ2U=") {
@@ -144,6 +240,7 @@ function getConversationRequestBody(fetchMock: ReturnType<typeof vi.fn>) {
 describe("App", () => {
   beforeEach(() => {
     mockApi();
+    mockSpeechSynthesis();
   });
 
   afterEach(() => {
@@ -177,7 +274,14 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Frames:")).toBeInTheDocument();
     expect(screen.getByText("0 / 3")).toBeInTheDocument();
-    expect(screen.queryByText("等待语音输入")).not.toBeInTheDocument();
+    expect(screen.getByText("等待语音输入")).toBeInTheDocument();
+    expect(screen.getByText("等待播报")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "开始语音监听" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "停止播报" })
+    ).toBeInTheDocument();
 
     await waitFor(() => {
       expect(screen.getByText("后端在线")).toBeInTheDocument();
@@ -208,6 +312,150 @@ describe("App", () => {
       expect(screen.getByText("实时画面")).toBeInTheDocument();
       expect(screen.getByLabelText("实时摄像头预览")).toBeInTheDocument();
     });
+  });
+
+  it("starts Web Speech listening from the independent microphone control", async () => {
+    const Recognition = mockSpeechRecognition();
+    mockMediaSession();
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始摄像头" }));
+    await screen.findByLabelText("实时摄像头预览");
+
+    fireEvent.click(screen.getByRole("button", { name: "开始语音监听" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("正在监听")).toBeInTheDocument();
+    });
+
+    const recognition = Recognition.instances[0];
+
+    expect(recognition).toBeDefined();
+    expect(recognition.start).toHaveBeenCalledTimes(1);
+    expect(recognition.lang).toBe("zh-CN");
+    expect(recognition.interimResults).toBe(true);
+    expect(recognition.continuous).toBe(false);
+  });
+
+  it("shows interim transcription while Web Speech recognition is producing partial text", async () => {
+    const Recognition = mockSpeechRecognition();
+    mockMediaSession();
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始摄像头" }));
+    await screen.findByLabelText("实时摄像头预览");
+    fireEvent.click(screen.getByRole("button", { name: "开始语音监听" }));
+
+    Recognition.instances[0].emitResult([
+      {
+        isFinal: false,
+        transcript: "你看到"
+      }
+    ]);
+
+    await waitFor(() => {
+      expect(screen.getByText("转写中")).toBeInTheDocument();
+      expect(screen.getByText("你看到")).toBeInTheDocument();
+    });
+  });
+
+  it("auto-submits final speech transcription, speaks the reply, and resumes listening after TTS ends", async () => {
+    const fetchMock = mockApi();
+    const Recognition = mockSpeechRecognition();
+    const speechSynthesisMock = mockSpeechSynthesis();
+    mockMediaSession();
+    const { getContext, toDataUrl } = mockCanvas();
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始摄像头" }));
+    await screen.findByLabelText("实时摄像头预览");
+    fireEvent.click(screen.getByRole("button", { name: "开始语音监听" }));
+
+    Recognition.instances[0].emitResult([
+      {
+        isFinal: true,
+        transcript: "你看到了什么？"
+      }
+    ]);
+
+    await waitFor(() => {
+      expect(screen.getByText("我看到一张桌面画面。")).toBeInTheDocument();
+      expect(screen.getByText("正在播报")).toBeInTheDocument();
+    });
+
+    const body = getConversationRequestBody(fetchMock);
+
+    expect(body.text).toBe("你看到了什么？");
+    expect(body.keyframes).toHaveLength(1);
+    expect(speechSynthesisMock.cancel).toHaveBeenCalled();
+    expect(speechSynthesisMock.speak).toHaveBeenCalledTimes(1);
+    expect(MockSpeechSynthesisUtterance.instances[0]).toMatchObject({
+      lang: "zh-CN",
+      text: "我看到一张桌面画面。"
+    });
+
+    MockSpeechSynthesisUtterance.instances[0].onend?.(new Event("end"));
+
+    await waitFor(() => {
+      expect(Recognition.instances).toHaveLength(2);
+      expect(Recognition.instances[1].start).toHaveBeenCalledTimes(1);
+      expect(screen.getByText("正在监听")).toBeInTheDocument();
+    });
+
+    getContext.mockRestore();
+    toDataUrl.mockRestore();
+  });
+
+  it("stops current browser speech synthesis and shows stopped status", async () => {
+    const Recognition = mockSpeechRecognition();
+    const speechSynthesisMock = mockSpeechSynthesis();
+    mockMediaSession();
+    const { getContext, toDataUrl } = mockCanvas();
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始摄像头" }));
+    await screen.findByLabelText("实时摄像头预览");
+    fireEvent.click(screen.getByRole("button", { name: "开始语音监听" }));
+
+    Recognition.instances[0].emitResult([
+      {
+        isFinal: true,
+        transcript: "请说明画面。"
+      }
+    ]);
+
+    await screen.findByText("正在播报");
+
+    fireEvent.click(screen.getByRole("button", { name: "停止播报" }));
+
+    expect(speechSynthesisMock.cancel).toHaveBeenCalled();
+    expect(screen.getByText("播报已停止")).toBeInTheDocument();
+
+    getContext.mockRestore();
+    toDataUrl.mockRestore();
+  });
+
+  it("shows a clear unsupported message when Web Speech recognition is unavailable", async () => {
+    const fetchMock = mockApi();
+    mockMediaSession();
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始摄像头" }));
+    await screen.findByLabelText("实时摄像头预览");
+    fireEvent.click(screen.getByRole("button", { name: "开始语音监听" }));
+
+    expect(
+      screen.getByText("当前浏览器不支持语音识别，请使用 Chrome 或继续手动输入。")
+    ).toBeInTheDocument();
+    expect(screen.getByText("不支持语音识别")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn")
+    ).toBe(false);
   });
 
   it("shows a clear error when capturing before media is active", () => {

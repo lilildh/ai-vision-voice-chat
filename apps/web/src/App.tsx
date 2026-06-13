@@ -15,6 +15,15 @@ import {
 
 type BackendStatus = "checking" | "online" | "offline";
 type SessionStatus = "idle" | "starting" | "active" | "error";
+type SpeechStatus =
+  | "idle"
+  | "unsupported"
+  | "listening"
+  | "transcribing"
+  | "paused"
+  | "error";
+type TtsStatus = "idle" | "speaking" | "stopped" | "unsupported" | "error";
+type SubmitSource = "text" | "voice";
 
 type HealthResponse = {
   ok: boolean;
@@ -64,8 +73,24 @@ function toRequestKeyframe(keyframe: CapturedKeyframe) {
   };
 }
 
+function getSpeechRecognitionConstructor() {
+  return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null;
+}
+
 export function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const shouldResumeListeningRef = useRef(false);
+  const isRecognitionActiveRef = useRef(false);
+  const isSubmittingRef = useRef(false);
+  const isSpeakingRef = useRef(false);
+  const keyframesRef = useRef<CapturedKeyframe[]>([]);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const messagesRef = useRef<ConversationMessage[]>([]);
+  const sessionIdRef = useRef<string | null>(null);
+  const sessionStatsRef = useRef<ConversationSessionStats>(initialStats);
+  const sessionStatusRef = useRef<SessionStatus>("idle");
+  const speechStatusRef = useRef<SpeechStatus>("idle");
   const [backendStatus, setBackendStatus] =
     useState<BackendStatus>("checking");
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
@@ -80,8 +105,14 @@ export function App() {
   const [promptText, setPromptText] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [speechStatus, setSpeechStatus] = useState<SpeechStatus>("idle");
+  const [ttsStatus, setTtsStatus] = useState<TtsStatus>("idle");
+  const [interimTranscript, setInterimTranscript] = useState("");
+  const [lastTranscript, setLastTranscript] = useState("");
 
   const isSessionActive = sessionStatus === "active";
+  const isSpeechListening =
+    speechStatus === "listening" || speechStatus === "transcribing";
   const cameraStatus =
     sessionStatus === "starting"
       ? "权限检查中"
@@ -104,6 +135,37 @@ export function App() {
   const latencyLabel = latencyMs === null ? "--" : `${latencyMs}ms`;
   const frameCountLabel = `${keyframes.length} / ${maxKeyframesPerTurn}`;
   const modelCostLabel = formatUsd(sessionStats.estimatedUsd);
+  const speechButtonLabel = isSpeechListening
+    ? "停止语音监听"
+    : "开始语音监听";
+  const speechStatusLabel =
+    speechStatus === "unsupported"
+      ? "不支持语音识别"
+      : speechStatus === "listening"
+        ? "正在监听"
+        : speechStatus === "transcribing"
+          ? "转写中"
+          : speechStatus === "paused"
+            ? "语音暂停"
+            : speechStatus === "error"
+              ? "语音识别出错"
+              : "等待语音输入";
+  const ttsStatusLabel =
+    ttsStatus === "speaking"
+      ? "正在播报"
+      : ttsStatus === "stopped"
+        ? "播报已停止"
+        : ttsStatus === "unsupported"
+          ? "不支持语音播报"
+          : ttsStatus === "error"
+            ? "语音播报出错"
+            : "等待播报";
+  const transcriptPreview = interimTranscript || lastTranscript || "暂无转写";
+
+  function setSpeechStatusState(nextStatus: SpeechStatus) {
+    speechStatusRef.current = nextStatus;
+    setSpeechStatus(nextStatus);
+  }
 
   useEffect(() => {
     let isMounted = true;
@@ -144,10 +206,41 @@ export function App() {
   }, [mediaStream]);
 
   useEffect(() => {
+    keyframesRef.current = keyframes;
+  }, [keyframes]);
+
+  useEffect(() => {
+    mediaStreamRef.current = mediaStream;
+  }, [mediaStream]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
+
+  useEffect(() => {
+    sessionStatsRef.current = sessionStats;
+  }, [sessionStats]);
+
+  useEffect(() => {
+    sessionStatusRef.current = sessionStatus;
+  }, [sessionStatus]);
+
+  useEffect(() => {
     return () => {
       stopMediaStream(mediaStream);
     };
   }, [mediaStream]);
+
+  useEffect(() => {
+    return () => {
+      stopVoiceRecognition({ clearAutoResume: true });
+      window.speechSynthesis?.cancel();
+    };
+  }, []);
 
   async function startSession() {
     setErrorMessage(null);
@@ -176,6 +269,11 @@ export function App() {
       setSessionId(createSessionId());
       setSessionStartedAt(new Date());
       setSessionStatus("active");
+      setSpeechStatusState("idle");
+      setTtsStatus("idle");
+      setInterimTranscript("");
+      setLastTranscript("");
+      shouldResumeListeningRef.current = false;
     } catch (error) {
       setMediaStream(null);
       setSessionId(null);
@@ -186,6 +284,9 @@ export function App() {
   }
 
   function stopSession() {
+    stopVoiceRecognition({ clearAutoResume: true });
+    window.speechSynthesis?.cancel();
+    isSpeakingRef.current = false;
     stopMediaStream(mediaStream);
     setMediaStream(null);
     setKeyframes([]);
@@ -195,11 +296,18 @@ export function App() {
     setSessionId(null);
     setSessionStartedAt(null);
     setSessionStatus("idle");
+    setSpeechStatusState("idle");
+    setTtsStatus("idle");
+    setInterimTranscript("");
+    setLastTranscript("");
     setErrorMessage(null);
   }
 
   function captureFrame(frameIndex: number) {
-    if (!isSessionActive || !mediaStream) {
+    if (
+      sessionStatusRef.current !== "active" ||
+      mediaStreamRef.current === null
+    ) {
       throw new Error("请先启动摄像头，再截取关键帧。");
     }
 
@@ -212,6 +320,233 @@ export function App() {
     return captureCompressedKeyframe(video, {
       id: `frame-${Date.now()}-${frameIndex + 1}`
     });
+  }
+
+  function stopVoiceRecognition({
+    clearAutoResume = true
+  }: {
+    clearAutoResume?: boolean;
+  } = {}) {
+    if (clearAutoResume) {
+      shouldResumeListeningRef.current = false;
+    }
+
+    const recognition = recognitionRef.current;
+
+    if (recognition) {
+      recognition.onend = null;
+      recognition.onerror = null;
+      recognition.onresult = null;
+      recognition.onstart = null;
+      recognition.abort();
+    }
+
+    recognitionRef.current = null;
+    isRecognitionActiveRef.current = false;
+
+    if (speechStatusRef.current !== "unsupported") {
+      setSpeechStatusState("paused");
+    }
+  }
+
+  function startVoiceListening() {
+    setErrorMessage(null);
+
+    if (
+      sessionStatusRef.current !== "active" ||
+      mediaStreamRef.current === null
+    ) {
+      shouldResumeListeningRef.current = false;
+      setErrorMessage("请先启动摄像头，再开始语音监听。");
+      setSpeechStatusState("error");
+      return;
+    }
+
+    const SpeechRecognitionConstructor = getSpeechRecognitionConstructor();
+
+    if (!SpeechRecognitionConstructor) {
+      shouldResumeListeningRef.current = false;
+      setSpeechStatusState("unsupported");
+      setErrorMessage("当前浏览器不支持语音识别，请使用 Chrome 或继续手动输入。");
+      return;
+    }
+
+    shouldResumeListeningRef.current = true;
+
+    if (isSubmittingRef.current || isSpeakingRef.current) {
+      setSpeechStatusState("paused");
+      return;
+    }
+
+    if (isRecognitionActiveRef.current) {
+      return;
+    }
+
+    stopVoiceRecognition({ clearAutoResume: false });
+
+    const recognition = new SpeechRecognitionConstructor();
+
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = "zh-CN";
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      isRecognitionActiveRef.current = true;
+      setSpeechStatusState("listening");
+    };
+
+    recognition.onresult = (event) => {
+      let finalText = "";
+      let interimText = "";
+
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const transcript = result[0]?.transcript ?? "";
+
+        if (result.isFinal) {
+          finalText += transcript;
+        } else {
+          interimText += transcript;
+        }
+      }
+
+      const trimmedInterimText = interimText.trim();
+      const trimmedFinalText = finalText.trim();
+
+      if (trimmedInterimText) {
+        setInterimTranscript(trimmedInterimText);
+        setSpeechStatusState("transcribing");
+      }
+
+      if (trimmedFinalText) {
+        setLastTranscript(trimmedFinalText);
+        setInterimTranscript("");
+        setPromptText(trimmedFinalText);
+        setSpeechStatusState("transcribing");
+        isRecognitionActiveRef.current = false;
+        void submitQuestionText(trimmedFinalText, "voice");
+      }
+    };
+
+    recognition.onerror = (event) => {
+      isRecognitionActiveRef.current = false;
+      shouldResumeListeningRef.current = false;
+      setSpeechStatusState("error");
+      setErrorMessage(`语音识别失败：${event.error}。请重试或使用文本输入。`);
+    };
+
+    recognition.onend = () => {
+      isRecognitionActiveRef.current = false;
+
+      if (
+        shouldResumeListeningRef.current &&
+        !isSubmittingRef.current &&
+        !isSpeakingRef.current &&
+        sessionStatusRef.current === "active"
+      ) {
+        startVoiceListening();
+        return;
+      }
+
+      if (
+        speechStatusRef.current !== "unsupported" &&
+        speechStatusRef.current !== "error"
+      ) {
+        setSpeechStatusState("paused");
+      }
+    };
+
+    recognitionRef.current = recognition;
+
+    try {
+      recognition.start();
+      isRecognitionActiveRef.current = true;
+      setSpeechStatusState("listening");
+    } catch (error) {
+      isRecognitionActiveRef.current = false;
+      shouldResumeListeningRef.current = false;
+      setSpeechStatusState("error");
+      setErrorMessage(getErrorMessage(error));
+    }
+  }
+
+  function toggleVoiceListening() {
+    if (isSpeechListening) {
+      stopVoiceRecognition({ clearAutoResume: true });
+      return;
+    }
+
+    startVoiceListening();
+  }
+
+  function resumeListeningAfterSpeech() {
+    isSpeakingRef.current = false;
+
+    if (
+      shouldResumeListeningRef.current &&
+      sessionStatusRef.current === "active"
+    ) {
+      startVoiceListening();
+    }
+  }
+
+  function speakAssistantReply(text: string) {
+    if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+      setTtsStatus("unsupported");
+      setErrorMessage("浏览器不支持语音播报，已显示文本回复。");
+      resumeListeningAfterSpeech();
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "zh-CN";
+    utterance.rate = 1;
+
+    utterance.onstart = () => {
+      isSpeakingRef.current = true;
+      setTtsStatus("speaking");
+      setSpeechStatusState("paused");
+    };
+
+    utterance.onend = () => {
+      isSpeakingRef.current = false;
+      setTtsStatus("idle");
+      resumeListeningAfterSpeech();
+    };
+
+    utterance.onerror = () => {
+      isSpeakingRef.current = false;
+      setTtsStatus("error");
+      setErrorMessage("语音播报失败，已显示文本回复。");
+      resumeListeningAfterSpeech();
+    };
+
+    isSpeakingRef.current = true;
+    setTtsStatus("speaking");
+    setSpeechStatusState("paused");
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function stopSpeaking() {
+    if (!window.speechSynthesis) {
+      setTtsStatus("unsupported");
+      setErrorMessage("浏览器不支持语音播报，已显示文本回复。");
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    isSpeakingRef.current = false;
+    setTtsStatus("stopped");
+
+    if (
+      shouldResumeListeningRef.current &&
+      sessionStatusRef.current === "active"
+    ) {
+      startVoiceListening();
+    }
   }
 
   function captureKeyframe() {
@@ -230,44 +565,67 @@ export function App() {
     }
   }
 
-  async function submitTextQuestion(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    const text = promptText.trim();
+  async function submitQuestionText(rawText: string, source: SubmitSource) {
+    const text = rawText.trim();
 
     if (!text) {
-      setErrorMessage("请输入文本问题。");
+      setErrorMessage(
+        source === "voice" ? "语音转写为空，请再说一次。" : "请输入文本问题。"
+      );
+      if (source === "voice") {
+        shouldResumeListeningRef.current = false;
+        setSpeechStatusState("error");
+      }
       return;
     }
 
-    if (!isSessionActive || !mediaStream) {
-      setErrorMessage("请先启动摄像头，再发送文本问题。");
+    if (
+      sessionStatusRef.current !== "active" ||
+      mediaStreamRef.current === null
+    ) {
+      setErrorMessage(
+        source === "voice"
+          ? "请先启动摄像头，再开始语音提问。"
+          : "请先启动摄像头，再发送文本问题。"
+      );
       return;
     }
 
-    let requestKeyframes = keyframes;
+    let requestKeyframes = keyframesRef.current;
 
     if (requestKeyframes.length === 0) {
       try {
         requestKeyframes = [captureFrame(0)];
+        keyframesRef.current = requestKeyframes;
         setKeyframes(requestKeyframes);
       } catch (error) {
         setErrorMessage(getErrorMessage(error));
+        if (source === "voice") {
+          shouldResumeListeningRef.current = false;
+          setSpeechStatusState("error");
+        }
         return;
       }
     }
 
-    const activeSessionId = sessionId ?? createSessionId();
-    const requestMessages = messages.map((message) => ({
+    const activeSessionId = sessionIdRef.current ?? createSessionId();
+    const requestMessages = messagesRef.current.map((message) => ({
       createdAt: message.createdAt,
       role: message.role,
       text: message.text
     }));
 
-    if (!sessionId) {
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = activeSessionId;
       setSessionId(activeSessionId);
     }
 
+    if (source === "voice") {
+      setPromptText(text);
+      setSpeechStatusState("paused");
+    }
+
+    isSubmittingRef.current = true;
     setIsSubmitting(true);
     setErrorMessage(null);
 
@@ -277,23 +635,27 @@ export function App() {
         session: {
           messages: requestMessages,
           sessionId: activeSessionId,
-          stats: sessionStats
+          stats: sessionStatsRef.current
         },
         text
       });
 
       setLatencyMs(response.timing.totalMs);
+      sessionStatsRef.current = response.cost.session;
       setSessionStats(response.cost.session);
 
       if (!response.ok) {
         setErrorMessage(`${response.error.code}：${response.error.message}`);
+        if (source === "voice") {
+          shouldResumeListeningRef.current = false;
+          setSpeechStatusState("error");
+        }
         return;
       }
 
       const now = new Date().toISOString();
-
-      setMessages((currentMessages) => [
-        ...currentMessages,
+      const nextMessages: ConversationMessage[] = [
+        ...messagesRef.current,
         {
           createdAt: now,
           role: "user",
@@ -304,13 +666,27 @@ export function App() {
           role: "assistant",
           text: response.reply.text
         }
-      ]);
+      ];
+
+      messagesRef.current = nextMessages;
+      setMessages(nextMessages);
       setPromptText("");
+      speakAssistantReply(response.reply.text);
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
+      if (source === "voice") {
+        shouldResumeListeningRef.current = false;
+        setSpeechStatusState("error");
+      }
     } finally {
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
     }
+  }
+
+  async function submitTextQuestion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await submitQuestionText(promptText, "text");
   }
 
   return (
@@ -334,7 +710,7 @@ export function App() {
         </div>
       </header>
 
-      <main className="workspace" aria-label="AI 视觉文本桌面工作台">
+      <main className="workspace" aria-label="AI 视觉语音桌面工作台">
         <section className="vision-panel" aria-label="摄像头画面">
           <div className={`camera-feed ${isSessionActive ? "active" : ""}`}>
             {isSessionActive ? (
@@ -378,7 +754,7 @@ export function App() {
           </div>
         </section>
 
-        <section className="chat-panel" aria-label="文本对话">
+        <section className="chat-panel" aria-label="语音与文本对话">
           <div className="chat-scroll">
             <div className="session-chip">当前会话</div>
 
@@ -390,7 +766,7 @@ export function App() {
                       <span className="icon-memory" />
                     </div>
                     <div className="message-bubble assistant-bubble">
-                      <p>摄像头已连接，可以输入文本问题验证视觉链路。</p>
+                      <p>摄像头已连接，可以点击麦克风提问，也可以输入文本验证视觉链路。</p>
                       <div className="keyframe-strip" aria-label="关键帧预览">
                         {keyframes.length > 0 ? (
                           keyframes.map((keyframe, index) => (
@@ -466,6 +842,21 @@ export function App() {
           </div>
 
           <footer className="control-dock">
+            <div className="voice-status-panel" aria-label="语音状态">
+              <div>
+                <span>监听</span>
+                <strong>{speechStatusLabel}</strong>
+              </div>
+              <div>
+                <span>转写</span>
+                <strong>{transcriptPreview}</strong>
+              </div>
+              <div>
+                <span>播报</span>
+                <strong>{ttsStatusLabel}</strong>
+              </div>
+            </div>
+
             <form className="prompt-form" onSubmit={submitTextQuestion}>
               <textarea
                 aria-label="文本问题"
@@ -497,6 +888,17 @@ export function App() {
                 <span className="icon-camera" aria-hidden="true" />
               </button>
               <button
+                className="round-button mic-button"
+                type="button"
+                aria-label={speechButtonLabel}
+                disabled={
+                  !isSessionActive || isSubmitting || ttsStatus === "speaking"
+                }
+                onClick={toggleVoiceListening}
+              >
+                <span className="icon-mic" aria-hidden="true" />
+              </button>
+              <button
                 className="round-button camera-button"
                 type="button"
                 aria-label={sessionStatus === "starting" ? "启动中" : "开始摄像头"}
@@ -504,6 +906,15 @@ export function App() {
                 onClick={startSession}
               >
                 <span className="icon-video" aria-hidden="true" />
+              </button>
+              <button
+                className="round-button ghost-button"
+                type="button"
+                aria-label="停止播报"
+                disabled={ttsStatus !== "speaking"}
+                onClick={stopSpeaking}
+              >
+                <span className="icon-stop" aria-hidden="true" />
               </button>
               <button
                 className="round-button ghost-button danger-button"
