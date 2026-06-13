@@ -77,7 +77,13 @@ function setValidModelEnv(overrides: NodeJS.ProcessEnv = {}) {
   }
 }
 
-function createFakeMultimodalProvider(options: { rejectWith?: Error } = {}) {
+function createFakeMultimodalProvider(
+  options: {
+    rejectWith?: Error;
+    streamDeltas?: string[];
+    streamRejectWith?: Error;
+  } = {}
+) {
   const calls: MultimodalProviderRequest[] = [];
   const provider: MultimodalProvider = {
     async complete(request) {
@@ -92,6 +98,31 @@ function createFakeMultimodalProvider(options: { rejectWith?: Error } = {}) {
         modelName: request.config.modelName,
         provider: "openai-compatible",
         text: "我看到一张桌面关键帧。"
+      };
+    },
+    async completeStream(request, onDelta) {
+      calls.push(request);
+
+      if (options.streamRejectWith) {
+        throw options.streamRejectWith;
+      }
+
+      const deltas = options.streamDeltas ?? ["我看到", "一张桌面关键帧。"];
+
+      for (const delta of deltas) {
+        onDelta(delta);
+      }
+
+      return {
+        modelMs: 12,
+        modelName: request.config.modelName,
+        provider: "openai-compatible",
+        text: deltas.join(""),
+        usage: {
+          inputTokens: 21,
+          outputTokens: 8,
+          totalTokens: 29
+        }
       };
     }
   };
@@ -131,6 +162,66 @@ async function postConversationTurn(body: unknown, app = createApp()) {
     body: response._getJSONData(),
     status: response._getStatusCode()
   };
+}
+
+async function postConversationTurnStream(body: unknown, app = createApp()) {
+  const request = createRequest({
+    body,
+    headers: {
+      "content-type": "application/json"
+    },
+    method: "POST",
+    url: "/api/conversation-turn/stream"
+  });
+  const response = createResponse({ eventEmitter: EventEmitter });
+  const completed = new Promise<void>((resolve) => {
+    response.on("end", () => resolve());
+  });
+
+  app.use((_request, fallbackResponse) => {
+    fallbackResponse.status(404).json({
+      error: {
+        code: "NOT_FOUND"
+      },
+      ok: false
+    });
+  });
+  app.handle(request, response);
+  await completed;
+
+  return {
+    body: String(response._getData()),
+    headers: response._getHeaders(),
+    status: response._getStatusCode()
+  };
+}
+
+function parseSseEvents(rawBody: string) {
+  return rawBody
+    .trim()
+    .split("\n\n")
+    .filter(Boolean)
+    .map((block) => {
+      const event = {
+        data: "",
+        event: "message"
+      };
+
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event: ")) {
+          event.event = line.slice("event: ".length);
+        }
+
+        if (line.startsWith("data: ")) {
+          event.data += line.slice("data: ".length);
+        }
+      }
+
+      return {
+        event: event.event,
+        data: JSON.parse(event.data) as unknown
+      };
+    });
 }
 
 function restoreModelEnv() {
@@ -520,6 +611,147 @@ describe("POST /api/conversation-turn", () => {
         retryable: false
       },
       ok: false
+    });
+  });
+
+  it("streams statuses, assistant deltas, and final completion over SSE", async () => {
+    setValidModelEnv({
+      MODEL_MAX_OUTPUT_TOKENS: "128",
+      MODEL_TIMEOUT_MS: "3000"
+    });
+    const fake = createFakeMultimodalProvider({
+      streamDeltas: ["我看到", "桌面上的杯子。"]
+    });
+
+    const response = await postConversationTurnStream(
+      validRequestBody(),
+      createApp({ multimodalProvider: fake.provider })
+    );
+    const events = parseSseEvents(response.body);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(events.map((event) => event.event)).toEqual([
+      "status",
+      "status",
+      "status",
+      "status",
+      "status",
+      "delta",
+      "delta",
+      "status",
+      "complete"
+    ]);
+    expect(events.slice(0, 5).map((event) => event.data)).toEqual([
+      { phase: "validating" },
+      { phase: "estimating-cost" },
+      { phase: "checking-model" },
+      { phase: "calling-model" },
+      { phase: "streaming-reply" }
+    ]);
+    expect(events[5].data).toEqual({ text: "我看到" });
+    expect(events[6].data).toEqual({ text: "桌面上的杯子。" });
+    expect(events[7].data).toEqual({ phase: "completed" });
+    expect(events[8].data).toMatchObject({
+      cost: {
+        request: {
+          cloudCallAttempted: true
+        }
+      },
+      model: {
+        name: "vision-model",
+        provider: "openai-compatible",
+        usage: {
+          inputTokens: 21,
+          outputTokens: 8,
+          totalTokens: 29
+        }
+      },
+      ok: true,
+      reply: {
+        role: "assistant",
+        text: "我看到桌面上的杯子。"
+      }
+    });
+  });
+
+  it("streams validation errors as explicit SSE error events", async () => {
+    const response = await postConversationTurnStream(
+      validRequestBody({ text: "   " })
+    );
+    const events = parseSseEvents(response.body);
+
+    expect(response.status).toBe(200);
+    expect(events).toEqual([
+      {
+        data: { phase: "validating" },
+        event: "status"
+      },
+      {
+        data: {
+          response: expect.objectContaining({
+            cost: {
+              request: expect.objectContaining({
+                cloudCallAttempted: false
+              }),
+              session: expect.any(Object)
+            },
+            error: expect.objectContaining({
+              code: "EMPTY_TEXT",
+              retryable: false
+            }),
+            ok: false
+          }),
+          status: 400
+        },
+        event: "error"
+      }
+    ]);
+  });
+
+  it("streams provider failures with attempted cloud-call cost", async () => {
+    setValidModelEnv();
+    const providerError = new MultimodalProviderError({
+      code: "MODEL_PROVIDER_ERROR",
+      details: {
+        providerStatus: 502
+      },
+      message: "上游模型调用失败。",
+      retryable: true,
+      status: 502
+    });
+    const fake = createFakeMultimodalProvider({
+      streamRejectWith: providerError
+    });
+
+    const response = await postConversationTurnStream(
+      validRequestBody(),
+      createApp({ multimodalProvider: fake.provider })
+    );
+    const events = parseSseEvents(response.body);
+    const errorEvent = events.at(-1);
+
+    expect(errorEvent).toMatchObject({
+      event: "error",
+      data: {
+        response: {
+          cost: {
+            request: {
+              cloudCallAttempted: true
+            }
+          },
+          error: {
+            code: "MODEL_PROVIDER_ERROR",
+            details: {
+              providerStatus: 502
+            },
+            message: "上游模型调用失败。",
+            retryable: true
+          },
+          ok: false
+        },
+        status: 502
+      }
     });
   });
 });

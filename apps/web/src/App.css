@@ -536,6 +536,12 @@ button {
   backdrop-filter: blur(12px);
 }
 
+.pending-bubble {
+  border-color: rgb(0 220 229 / 28%);
+  background: rgb(0 220 229 / 8%);
+  color: #d8fdff;
+}
+
 .message time {
   color: rgb(199 196 216 / 58%);
   font-size: 0.72rem;
@@ -613,6 +619,10 @@ button {
 }
 
 .error-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
   border: 1px solid rgb(239 68 68 / 30%);
   border-radius: 6px;
   background: rgb(239 68 68 / 10%);
@@ -621,6 +631,14 @@ button {
   font-size: 0.84rem;
   font-weight: 700;
   line-height: 1.55;
+}
+
+.error-banner strong {
+  border: 1px solid rgb(254 202 202 / 22%);
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: #fee2e2;
+  font-size: 0.72rem;
 }
 
 .equalizer {
@@ -668,7 +686,7 @@ button {
 
 .voice-status-panel {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }

@@ -5,7 +5,8 @@ import { CONVERSATION_BODY_LIMIT } from "./conversation-contract";
 import { createCostControlService } from "./cost-control";
 import {
   type CostControlService,
-  createConversationTurnHandler
+  createConversationTurnHandler,
+  createConversationTurnStreamHandler
 } from "./conversation-route";
 import { createZeroCost } from "./conversation-validation";
 import {
@@ -37,6 +38,10 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post(
     "/api/conversation-turn",
     createConversationTurnHandler(costControlService, multimodalProvider)
+  );
+  app.post(
+    "/api/conversation-turn/stream",
+    createConversationTurnStreamHandler(costControlService, multimodalProvider)
   );
 
   app.use(

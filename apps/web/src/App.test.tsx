@@ -8,6 +8,9 @@ type MockConversationResponse =
       ok: true;
       reply: { role: "assistant"; text: string };
       cost: {
+        request?: {
+          cloudCallAttempted: boolean;
+        };
         session: {
           estimatedUsd: number;
           keyframeCount: number;
@@ -20,6 +23,9 @@ type MockConversationResponse =
       ok: false;
       error: { code: string; message: string; retryable: boolean };
       cost: {
+        request?: {
+          cloudCallAttempted: boolean;
+        };
         session: {
           estimatedUsd: number;
           keyframeCount: number;
@@ -31,6 +37,9 @@ type MockConversationResponse =
 
 const successResponse: MockConversationResponse = {
   cost: {
+    request: {
+      cloudCallAttempted: true
+    },
     session: {
       estimatedUsd: 0.00042,
       keyframeCount: 1,
@@ -117,7 +126,30 @@ class MockSpeechSynthesisUtterance {
   }
 }
 
-function mockApi(conversationResponse = successResponse) {
+function createSse(event: string, data: unknown) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function createStreamResponse(chunks: string[]) {
+  const encoder = new TextEncoder();
+
+  return {
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      }
+    }),
+    ok: true
+  } as Response;
+}
+
+function mockApi(
+  conversationResponse = successResponse,
+  options: { streamDeltas?: string[] } = {}
+) {
   const fetchMock = vi.fn(async (url: string | URL | Request) => {
     const requestUrl = typeof url === "string" ? url : url.toString();
 
@@ -131,11 +163,24 @@ function mockApi(conversationResponse = successResponse) {
       };
     }
 
-    if (requestUrl === "/api/conversation-turn") {
-      return {
-        ok: conversationResponse.ok,
-        json: async () => conversationResponse
-      };
+    if (requestUrl === "/api/conversation-turn/stream") {
+      if (!conversationResponse.ok) {
+        return createStreamResponse([
+          createSse("status", { phase: "validating" }),
+          createSse("error", { response: conversationResponse, status: 503 })
+        ]);
+      }
+
+      const deltas = options.streamDeltas ?? [conversationResponse.reply.text];
+
+      return createStreamResponse([
+        createSse("status", { phase: "validating" }),
+        createSse("status", { phase: "calling-model" }),
+        createSse("status", { phase: "streaming-reply" }),
+        ...deltas.map((delta) => createSse("delta", { text: delta })),
+        createSse("status", { phase: "completed" }),
+        createSse("complete", conversationResponse)
+      ]);
     }
 
     throw new Error(`unexpected fetch: ${requestUrl}`);
@@ -211,7 +256,7 @@ function mockCanvas(dataUrl = "data:image/jpeg;base64,aW1hZ2U=") {
 
 function getConversationRequestBody(fetchMock: ReturnType<typeof vi.fn>) {
   const call = fetchMock.mock.calls.find(
-    ([url]) => url === "/api/conversation-turn"
+    ([url]) => url === "/api/conversation-turn/stream"
   );
 
   expect(call).toBeDefined();
@@ -235,6 +280,14 @@ function getConversationRequestBody(fetchMock: ReturnType<typeof vi.fn>) {
     };
     text: string;
   };
+}
+
+function getConversationRequestBodies(fetchMock: ReturnType<typeof vi.fn>) {
+  return fetchMock.mock.calls
+    .filter(([url]) => url === "/api/conversation-turn/stream")
+    .map((call) => JSON.parse(call[1]?.body as string)) as ReturnType<
+    typeof getConversationRequestBody
+  >[];
 }
 
 describe("App", () => {
@@ -409,6 +462,82 @@ describe("App", () => {
     toDataUrl.mockRestore();
   });
 
+  it("shows streaming assistant deltas before completion and speaks only after complete", async () => {
+    const speechSynthesisMock = mockSpeechSynthesis();
+    mockMediaSession();
+    const { getContext, toDataUrl } = mockCanvas();
+    const encoder = new TextEncoder();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const requestUrl = typeof url === "string" ? url : url.toString();
+
+      if (requestUrl === "/api/health") {
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            service: "ai-vision-voice-chat-api"
+          })
+        };
+      }
+
+      if (requestUrl === "/api/conversation-turn/stream") {
+        return {
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            }
+          }),
+          ok: true
+        } as Response;
+      }
+
+      throw new Error(`unexpected fetch: ${requestUrl}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始摄像头" }));
+    await screen.findByLabelText("实时摄像头预览");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "文本问题" }), {
+      target: { value: "你看到了什么？" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送文本问题" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => url === "/api/conversation-turn/stream"
+        )
+      ).toBe(true);
+    });
+
+    streamController.enqueue(
+      encoder.encode(createSse("status", { phase: "streaming-reply" }))
+    );
+    streamController.enqueue(encoder.encode(createSse("delta", { text: "我看到" })));
+
+    await waitFor(() => {
+      expect(screen.getByText("我看到")).toBeInTheDocument();
+      expect(screen.getAllByText("正在生成回复").length).toBeGreaterThan(0);
+    });
+    expect(speechSynthesisMock.speak).not.toHaveBeenCalled();
+
+    streamController.enqueue(encoder.encode(createSse("complete", successResponse)));
+    streamController.close();
+
+    await waitFor(() => {
+      expect(screen.getByText("我看到一张桌面画面。")).toBeInTheDocument();
+      expect(speechSynthesisMock.speak).toHaveBeenCalledTimes(1);
+    });
+
+    getContext.mockRestore();
+    toDataUrl.mockRestore();
+  });
+
   it("stops current browser speech synthesis and shows stopped status", async () => {
     const Recognition = mockSpeechRecognition();
     const speechSynthesisMock = mockSpeechSynthesis();
@@ -454,7 +583,7 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("不支持语音识别")).toBeInTheDocument();
     expect(
-      fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn")
+      fetchMock.mock.calls.some(([url]) => url === "/api/conversation-turn/stream")
     ).toBe(false);
   });
 
@@ -553,7 +682,7 @@ describe("App", () => {
     expect(body.session.sessionId).toEqual(expect.any(String));
     expect(body.session.messages).toEqual([]);
     expect(screen.getByText("Frames:")).toBeInTheDocument();
-    expect(screen.getByText("1 / 3")).toBeInTheDocument();
+    expect(screen.getByText("0 / 3")).toBeInTheDocument();
     expect(screen.getByText("Cost:")).toBeInTheDocument();
     expect(screen.getByText("$0.000420")).toBeInTheDocument();
     expect(screen.getByText("Lat:")).toBeInTheDocument();
@@ -600,9 +729,50 @@ describe("App", () => {
     toDataUrl.mockRestore();
   });
 
+  it("sends only the latest six short-term context messages", async () => {
+    const fetchMock = mockApi();
+    mockMediaSession();
+    const { getContext, toDataUrl } = mockCanvas();
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始摄像头" }));
+    await screen.findByLabelText("实时摄像头预览");
+
+    for (let index = 1; index <= 5; index += 1) {
+      fireEvent.change(screen.getByRole("textbox", { name: "文本问题" }), {
+        target: { value: `问题 ${index}` }
+      });
+      fireEvent.click(screen.getByRole("button", { name: "发送文本问题" }));
+
+      await waitFor(() => {
+        expect(getConversationRequestBodies(fetchMock)).toHaveLength(index);
+      });
+    }
+
+    const bodies = getConversationRequestBodies(fetchMock);
+    const lastBody = bodies[4];
+
+    expect(lastBody.session.messages.map((message) => message.text)).toEqual([
+      "问题 2",
+      "我看到一张桌面画面。",
+      "问题 3",
+      "我看到一张桌面画面。",
+      "问题 4",
+      "我看到一张桌面画面。"
+    ]);
+    expect(toDataUrl).toHaveBeenCalledTimes(5);
+
+    getContext.mockRestore();
+    toDataUrl.mockRestore();
+  });
+
   it("shows backend errors while preserving text and keyframes for retry", async () => {
     mockApi({
       cost: {
+        request: {
+          cloudCallAttempted: false
+        },
         session: {
           estimatedUsd: 0,
           keyframeCount: 1,
@@ -634,8 +804,11 @@ describe("App", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText("MODEL_CONFIG_MISSING：模型配置缺失，无法调用云端多模态模型。")
+        screen.getByText(
+          "MODEL_CONFIG_MISSING：模型配置缺失，无法调用云端多模态模型。"
+        )
       ).toBeInTheDocument();
+      expect(screen.getByText("未尝试云端调用")).toBeInTheDocument();
     });
 
     expect(screen.getByRole("textbox", { name: "文本问题" })).toHaveValue(

@@ -42,6 +42,27 @@ function createJsonResponse(body: unknown, status = 200) {
   } as Response;
 }
 
+function createSseResponse(chunks: string[], status = 200) {
+  const encoder = new TextEncoder();
+
+  return {
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      }
+    }),
+    json: async () => {
+      throw new Error("stream response does not expose json");
+    },
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => chunks.join("")
+  } as Response;
+}
+
 describe("createOpenAiCompatibleMultimodalProvider", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -197,6 +218,47 @@ describe("createOpenAiCompatibleMultimodalProvider", () => {
       code: "MODEL_PROVIDER_TIMEOUT",
       retryable: true,
       status: 504
+    });
+  });
+
+  it("streams assistant deltas and aggregates the final OpenAI-compatible response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      createSseResponse([
+        'data: {"choices":[{"delta":{"content":"画面里"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"有杯子。"}}]}\n\n',
+        'data: {"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":7,"total_tokens":37}}\n\n',
+        "data: [DONE]\n\n"
+      ])
+    );
+    const provider = createOpenAiCompatibleMultimodalProvider({
+      fetch: fetchMock
+    });
+    const deltas: string[] = [];
+
+    const result = await provider.completeStream(baseRequest, (delta) => {
+      deltas.push(delta);
+    });
+
+    const [, init] = fetchMock.mock.calls[0];
+    const payload = JSON.parse(String(init.body));
+
+    expect(payload).toMatchObject({
+      model: "vision-model",
+      stream: true,
+      stream_options: {
+        include_usage: true
+      }
+    });
+    expect(deltas).toEqual(["画面里", "有杯子。"]);
+    expect(result).toMatchObject({
+      modelName: "vision-model",
+      provider: "openai-compatible",
+      text: "画面里有杯子。",
+      usage: {
+        inputTokens: 30,
+        outputTokens: 7,
+        totalTokens: 37
+      }
     });
   });
 });

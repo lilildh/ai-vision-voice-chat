@@ -5,7 +5,9 @@ import cameraFeedUrl from "./assets/camera-feed-reference.png";
 import {
   type ConversationMessage,
   type ConversationSessionStats,
-  postConversationTurn
+  type ConversationTurnResponse,
+  type ConversationTurnStatusPhase,
+  streamConversationTurn
 } from "./conversation-client";
 import {
   type CapturedKeyframe,
@@ -24,6 +26,12 @@ type SpeechStatus =
   | "error";
 type TtsStatus = "idle" | "speaking" | "stopped" | "unsupported" | "error";
 type SubmitSource = "text" | "voice";
+type TurnStatus =
+  | "idle"
+  | "capturing-frame"
+  | "sending"
+  | ConversationTurnStatusPhase
+  | "error";
 
 type HealthResponse = {
   ok: boolean;
@@ -61,6 +69,12 @@ function createSessionId() {
 
 function formatUsd(value: number) {
   return `$${value.toFixed(6)}`;
+}
+
+function getCloudCallLabel(response: ConversationTurnResponse) {
+  return response.cost.request?.cloudCallAttempted
+    ? "已尝试云端调用"
+    : "未尝试云端调用";
 }
 
 function toRequestKeyframe(keyframe: CapturedKeyframe) {
@@ -105,10 +119,15 @@ export function App() {
   const [promptText, setPromptText] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorCloudCallLabel, setErrorCloudCallLabel] = useState<string | null>(
+    null
+  );
   const [speechStatus, setSpeechStatus] = useState<SpeechStatus>("idle");
   const [ttsStatus, setTtsStatus] = useState<TtsStatus>("idle");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [lastTranscript, setLastTranscript] = useState("");
+  const [pendingAssistantText, setPendingAssistantText] = useState("");
+  const [turnStatus, setTurnStatus] = useState<TurnStatus>("idle");
 
   const isSessionActive = sessionStatus === "active";
   const isSpeechListening =
@@ -161,6 +180,26 @@ export function App() {
             ? "语音播报出错"
             : "等待播报";
   const transcriptPreview = interimTranscript || lastTranscript || "暂无转写";
+  const turnStatusLabel =
+    turnStatus === "capturing-frame"
+      ? "正在截取关键帧"
+      : turnStatus === "sending"
+        ? "正在发送请求"
+        : turnStatus === "validating"
+          ? "后端校验中"
+          : turnStatus === "estimating-cost"
+            ? "正在估算成本"
+            : turnStatus === "checking-model"
+              ? "检查模型配置"
+              : turnStatus === "calling-model"
+                ? "连接模型"
+                : turnStatus === "streaming-reply"
+                  ? "正在生成回复"
+                  : turnStatus === "completed"
+                    ? "回复完成"
+                    : turnStatus === "error"
+                      ? "请求失败"
+                      : "等待提问";
 
   function setSpeechStatusState(nextStatus: SpeechStatus) {
     speechStatusRef.current = nextStatus;
@@ -244,6 +283,7 @@ export function App() {
 
   async function startSession() {
     setErrorMessage(null);
+    setErrorCloudCallLabel(null);
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setSessionStatus("error");
@@ -271,8 +311,10 @@ export function App() {
       setSessionStatus("active");
       setSpeechStatusState("idle");
       setTtsStatus("idle");
+      setTurnStatus("idle");
       setInterimTranscript("");
       setLastTranscript("");
+      setPendingAssistantText("");
       shouldResumeListeningRef.current = false;
     } catch (error) {
       setMediaStream(null);
@@ -298,9 +340,12 @@ export function App() {
     setSessionStatus("idle");
     setSpeechStatusState("idle");
     setTtsStatus("idle");
+    setTurnStatus("idle");
     setInterimTranscript("");
     setLastTranscript("");
+    setPendingAssistantText("");
     setErrorMessage(null);
+    setErrorCloudCallLabel(null);
   }
 
   function captureFrame(frameIndex: number) {
@@ -559,6 +604,7 @@ export function App() {
       const keyframe = captureFrame(keyframes.length);
 
       setErrorMessage(null);
+      setErrorCloudCallLabel(null);
       setKeyframes((currentKeyframes) => [...currentKeyframes, keyframe]);
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
@@ -595,6 +641,7 @@ export function App() {
 
     if (requestKeyframes.length === 0) {
       try {
+        setTurnStatus("capturing-frame");
         requestKeyframes = [captureFrame(0)];
         keyframesRef.current = requestKeyframes;
         setKeyframes(requestKeyframes);
@@ -609,7 +656,7 @@ export function App() {
     }
 
     const activeSessionId = sessionIdRef.current ?? createSessionId();
-    const requestMessages = messagesRef.current.map((message) => ({
+    const requestMessages = messagesRef.current.slice(-6).map((message) => ({
       createdAt: message.createdAt,
       role: message.role,
       text: message.text
@@ -628,17 +675,33 @@ export function App() {
     isSubmittingRef.current = true;
     setIsSubmitting(true);
     setErrorMessage(null);
+    setErrorCloudCallLabel(null);
+    setPendingAssistantText("");
+    setTurnStatus("sending");
 
     try {
-      const response = await postConversationTurn({
-        keyframes: requestKeyframes.map(toRequestKeyframe),
-        session: {
-          messages: requestMessages,
-          sessionId: activeSessionId,
-          stats: sessionStatsRef.current
+      const response = await streamConversationTurn(
+        {
+          keyframes: requestKeyframes.map(toRequestKeyframe),
+          session: {
+            messages: requestMessages,
+            sessionId: activeSessionId,
+            stats: sessionStatsRef.current
+          },
+          text
         },
-        text
-      });
+        {
+          onDelta: (delta) => {
+            setPendingAssistantText((currentText) => currentText + delta);
+          },
+          onError: (errorResponse) => {
+            setErrorCloudCallLabel(getCloudCallLabel(errorResponse));
+          },
+          onStatus: (phase) => {
+            setTurnStatus(phase);
+          }
+        }
+      );
 
       setLatencyMs(response.timing.totalMs);
       sessionStatsRef.current = response.cost.session;
@@ -646,6 +709,8 @@ export function App() {
 
       if (!response.ok) {
         setErrorMessage(`${response.error.code}：${response.error.message}`);
+        setErrorCloudCallLabel(getCloudCallLabel(response));
+        setTurnStatus("error");
         if (source === "voice") {
           shouldResumeListeningRef.current = false;
           setSpeechStatusState("error");
@@ -671,9 +736,15 @@ export function App() {
       messagesRef.current = nextMessages;
       setMessages(nextMessages);
       setPromptText("");
+      keyframesRef.current = [];
+      setKeyframes([]);
+      setPendingAssistantText("");
+      setTurnStatus("completed");
       speakAssistantReply(response.reply.text);
     } catch (error) {
       setErrorMessage(getErrorMessage(error));
+      setErrorCloudCallLabel(null);
+      setTurnStatus("error");
       if (source === "voice") {
         shouldResumeListeningRef.current = false;
         setSpeechStatusState("error");
@@ -819,6 +890,18 @@ export function App() {
                       )}
                     </article>
                   ))}
+                  {pendingAssistantText ? (
+                    <article className="message assistant-message">
+                      <div className="assistant-row">
+                        <div className="assistant-avatar" aria-hidden="true">
+                          <span className="icon-memory" />
+                        </div>
+                        <div className="message-bubble assistant-bubble pending-bubble">
+                          <p>{pendingAssistantText}</p>
+                        </div>
+                      </div>
+                    </article>
+                  ) : null}
                 </div>
               </>
             ) : (
@@ -830,13 +913,14 @@ export function App() {
 
             {isSubmitting ? (
               <div className="submitting-note" role="status">
-                正在发送文本和关键帧
+                {turnStatusLabel}
               </div>
             ) : null}
 
             {errorMessage ? (
               <div className="error-banner" role="alert">
-                {errorMessage}
+                <span>{errorMessage}</span>
+                {errorCloudCallLabel ? <strong>{errorCloudCallLabel}</strong> : null}
               </div>
             ) : null}
           </div>
@@ -854,6 +938,10 @@ export function App() {
               <div>
                 <span>播报</span>
                 <strong>{ttsStatusLabel}</strong>
+              </div>
+              <div>
+                <span>模型</span>
+                <strong>{turnStatusLabel}</strong>
               </div>
             </div>
 

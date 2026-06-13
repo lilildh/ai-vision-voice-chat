@@ -47,12 +47,18 @@ export type CostStats = {
   };
 };
 
+export type ModelUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+};
+
 export type ConversationTurnSuccessResponse = {
   ok: true;
   reply: { role: "assistant"; text: string };
   session: { sessionId: string; turnId: string };
   cost: CostStats;
-  model: { provider: "openai-compatible"; name: string };
+  model: { provider: "openai-compatible"; name: string; usage?: ModelUsage };
   timing: { totalMs: number; modelMs: number | null };
 };
 

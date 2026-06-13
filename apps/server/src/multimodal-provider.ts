@@ -1,7 +1,8 @@
 import type {
   ConversationMessage,
   ConversationTurnErrorCode,
-  ConversationTurnRequest
+  ConversationTurnRequest,
+  ModelUsage
 } from "./conversation-contract";
 import type { ResolvedModelConfig } from "./model-config";
 
@@ -30,16 +31,18 @@ export type MultimodalProviderResult = {
   modelName: string;
   provider: ProviderName;
   text: string;
-  usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-  };
+  usage?: ModelUsage;
 };
+
+export type MultimodalProviderDeltaHandler = (delta: string) => void;
 
 export type MultimodalProvider = {
   complete(
     request: MultimodalProviderRequest
+  ): Promise<MultimodalProviderResult>;
+  completeStream(
+    request: MultimodalProviderRequest,
+    onDelta: MultimodalProviderDeltaHandler
   ): Promise<MultimodalProviderResult>;
 };
 
@@ -123,6 +126,22 @@ function buildMessages(request: MultimodalProviderRequest): OpenAiMessage[] {
   return [...historyMessages, currentUserMessage];
 }
 
+function buildPayload(request: MultimodalProviderRequest, stream: boolean) {
+  return {
+    max_tokens: request.config.maxOutputTokens,
+    messages: buildMessages(request),
+    model: request.config.modelName,
+    stream,
+    ...(stream
+      ? {
+          stream_options: {
+            include_usage: true
+          }
+        }
+      : {})
+  };
+}
+
 function extractTextFromContent(content: unknown) {
   if (typeof content === "string") {
     return content.trim();
@@ -188,6 +207,22 @@ function extractUsage(body: unknown): MultimodalProviderResult["usage"] {
   };
 }
 
+function extractDeltaText(body: unknown) {
+  if (!isRecord(body) || !Array.isArray(body.choices)) {
+    return "";
+  }
+
+  const firstChoice = body.choices[0];
+
+  if (!isRecord(firstChoice) || !isRecord(firstChoice.delta)) {
+    return "";
+  }
+
+  return typeof firstChoice.delta.content === "string"
+    ? firstChoice.delta.content
+    : "";
+}
+
 function truncateProviderMessage(message: string) {
   const normalized = message.trim();
 
@@ -214,6 +249,150 @@ function getErrorMessage(error: unknown) {
   return "unknown provider error";
 }
 
+function createProviderHeaders(request: MultimodalProviderRequest) {
+  return {
+    Authorization: `Bearer ${request.config.apiKey}`,
+    "Content-Type": "application/json"
+  };
+}
+
+async function fetchChatCompletions(
+  fetchImpl: FetchLike,
+  request: MultimodalProviderRequest,
+  stream: boolean,
+  signal: AbortSignal
+) {
+  return fetchImpl(buildChatCompletionsUrl(request.config.baseUrl), {
+    body: JSON.stringify(buildPayload(request, stream)),
+    headers: createProviderHeaders(request),
+    method: "POST",
+    signal
+  });
+}
+
+async function assertProviderOk(response: Response) {
+  if (response.ok) {
+    return;
+  }
+
+  throw new MultimodalProviderError({
+    code: "MODEL_PROVIDER_ERROR",
+    details: {
+      providerMessage: await readProviderErrorMessage(response),
+      providerStatus: response.status
+    },
+    message: "模型 provider 返回错误。",
+    retryable: response.status === 429 || response.status >= 500,
+    status: 502
+  });
+}
+
+function parseSseDataLines(block: string) {
+  return block
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n")
+    .trim();
+}
+
+function parseStreamJson(data: string) {
+  try {
+    return JSON.parse(data) as unknown;
+  } catch (error) {
+    throw new MultimodalProviderError({
+      code: "MODEL_PROVIDER_ERROR",
+      details: {
+        reason: getErrorMessage(error)
+      },
+      message: "模型 provider 返回了无法解析的流式响应。",
+      retryable: true,
+      status: 502
+    });
+  }
+}
+
+async function readOpenAiCompatibleStream(
+  response: Response,
+  onDelta: MultimodalProviderDeltaHandler
+) {
+  if (!response.body) {
+    throw new MultimodalProviderError({
+      code: "MODEL_PROVIDER_ERROR",
+      message: "模型 provider 未返回可读取的流式响应。",
+      retryable: true,
+      status: 502
+    });
+  }
+
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  let buffer = "";
+  let text = "";
+  let usage: ModelUsage | undefined;
+  let done = false;
+
+  function consumeBlock(block: string) {
+    const data = parseSseDataLines(block);
+
+    if (!data) {
+      return;
+    }
+
+    if (data === "[DONE]") {
+      done = true;
+      return;
+    }
+
+    const body = parseStreamJson(data);
+    const delta = extractDeltaText(body);
+    const nextUsage = extractUsage(body);
+
+    if (nextUsage) {
+      usage = nextUsage;
+    }
+
+    if (delta.length > 0) {
+      text += delta;
+      onDelta(delta);
+    }
+  }
+
+  while (!done) {
+    const { done: readerDone, value } = await reader.read();
+
+    if (readerDone) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+
+    for (;;) {
+      const separatorIndex = buffer.indexOf("\n\n");
+
+      if (separatorIndex === -1) {
+        break;
+      }
+
+      const block = buffer.slice(0, separatorIndex);
+      buffer = buffer.slice(separatorIndex + 2);
+      consumeBlock(block);
+    }
+  }
+
+  buffer += decoder.decode();
+
+  if (buffer.trim().length > 0) {
+    consumeBlock(buffer);
+  }
+
+  return {
+    text: text.trim(),
+    usage
+  };
+}
+
 export function createOpenAiCompatibleMultimodalProvider(
   options: OpenAiCompatibleProviderOptions = {}
 ): MultimodalProvider {
@@ -229,36 +408,14 @@ export function createOpenAiCompatibleMultimodalProvider(
       }, request.config.timeoutMs);
 
       try {
-        const response = await fetchImpl(
-          buildChatCompletionsUrl(request.config.baseUrl),
-          {
-            body: JSON.stringify({
-              max_tokens: request.config.maxOutputTokens,
-              messages: buildMessages(request),
-              model: request.config.modelName,
-              stream: false
-            }),
-            headers: {
-              Authorization: `Bearer ${request.config.apiKey}`,
-              "Content-Type": "application/json"
-            },
-            method: "POST",
-            signal: controller.signal
-          }
+        const response = await fetchChatCompletions(
+          fetchImpl,
+          request,
+          false,
+          controller.signal
         );
 
-        if (!response.ok) {
-          throw new MultimodalProviderError({
-            code: "MODEL_PROVIDER_ERROR",
-            details: {
-              providerMessage: await readProviderErrorMessage(response),
-              providerStatus: response.status
-            },
-            message: "模型 provider 返回错误。",
-            retryable: response.status === 429 || response.status >= 500,
-            status: 502
-          });
-        }
+        await assertProviderOk(response);
 
         const body = await response.json();
         const text = extractAssistantText(body);
@@ -278,6 +435,72 @@ export function createOpenAiCompatibleMultimodalProvider(
           provider: "openai-compatible",
           text,
           usage: extractUsage(body)
+        };
+      } catch (error) {
+        if (error instanceof MultimodalProviderError) {
+          throw error;
+        }
+
+        if (controller.signal.aborted || isAbortError(error)) {
+          throw new MultimodalProviderError({
+            code: "MODEL_PROVIDER_TIMEOUT",
+            details: {
+              timeoutMs: request.config.timeoutMs
+            },
+            message: "模型 provider 调用超时。",
+            retryable: true,
+            status: 504
+          });
+        }
+
+        throw new MultimodalProviderError({
+          code: "MODEL_PROVIDER_ERROR",
+          details: {
+            reason: getErrorMessage(error)
+          },
+          message: "模型 provider 调用失败。",
+          retryable: true,
+          status: 502
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+
+    async completeStream(request, onDelta) {
+      const startedAt = Date.now();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => {
+        controller.abort();
+      }, request.config.timeoutMs);
+
+      try {
+        const response = await fetchChatCompletions(
+          fetchImpl,
+          request,
+          true,
+          controller.signal
+        );
+
+        await assertProviderOk(response);
+
+        const completion = await readOpenAiCompatibleStream(response, onDelta);
+
+        if (completion.text.length === 0) {
+          throw new MultimodalProviderError({
+            code: "MODEL_PROVIDER_ERROR",
+            message: "模型 provider 返回了空回复。",
+            retryable: true,
+            status: 502
+          });
+        }
+
+        return {
+          modelMs: Date.now() - startedAt,
+          modelName: request.config.modelName,
+          provider: "openai-compatible",
+          text: completion.text,
+          usage: completion.usage
         };
       } catch (error) {
         if (error instanceof MultimodalProviderError) {

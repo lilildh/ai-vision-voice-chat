@@ -6,27 +6,27 @@
 
 ## 当前状态
 
-当前仓库已具备最小前后端 TypeScript 脚手架，但尚未进入业务功能实现。
+当前仓库已具备首版流式多模态对话闭环。前端通过浏览器摄像头、Web Speech API 和 `speechSynthesis` 完成采集与播报；后端通过 OpenAI-compatible provider 代理真实多模态模型，并负责校验、限流、会话轮次限制和成本估算。
 
 已完成内容：
 
 - 产品定位与首版范围
 - 用户故事与非目标场景
-- 前端与后端职责划分
-- OpenAI-compatible 多模态 provider 适配方案
-- 浏览器 Web Speech API 与浏览器 TTS 策略
-- 关键帧采样、成本控制与隐私边界
-- 错误处理与验收标准
-- Vite + React + TypeScript 前端基础工程
-- Node/Express + TypeScript 后端基础工程
+- 摄像头预览、关键帧截取、压缩和每轮 3 张上限
+- Web Speech API 语音转写、手动文本提问和浏览器 TTS 播报
+- 流式 `/api/conversation-turn/stream` 多模态对话接口
+- 保留非流式 `/api/conversation-turn` 兼容接口
+- OpenAI-compatible 多模态 provider，支持非流式和 `stream: true`
+- 最近 6 条短期上下文发送策略
+- 服务端请求校验、限流、会话轮次限制、成本估算和明确错误码
+- 前端状态流转、错误展示、延迟和成本展示
 - 根目录 `npm run dev`、`npm test`、`npm run build`、`npm run typecheck` 脚本
 
 尚未完成内容：
 
-- 摄像头预览、麦克风采集和语音转写
-- 多模态模型 provider 真实调用
-- ASR、TTS 的端到端联调
-- 限流、成本估算和会话上下文管理
+- 真实 Chrome 麦克风权限和识别质量的人工验收
+- 真实系统语音播报声音的人工验收
+- 配置真实 `MODEL_*` 后的云端多模态质量验收
 
 ## 本地运行
 
@@ -40,6 +40,24 @@ npm install
 
 ```bash
 npm run dev
+```
+
+真实模型调用需要在启动后端前设置：
+
+```bash
+export MODEL_BASE_URL="https://your-openai-compatible-host/v1"
+export MODEL_API_KEY="your-api-key"
+export MODEL_NAME="your-vision-model"
+export MODEL_TIMEOUT_MS=30000
+export MODEL_MAX_OUTPUT_TOKENS=512
+```
+
+可选成本估算配置：
+
+```bash
+export COST_IMAGE_TOKENS_PER_KEYFRAME=850
+export COST_INPUT_USD_PER_1M_TOKENS=5
+export COST_OUTPUT_USD_PER_1M_TOKENS=15
 ```
 
 运行测试：
@@ -60,13 +78,15 @@ npm run typecheck
 npm run build
 ```
 
-后端当前仅提供健康检查接口：
+后端接口：
 
 ```text
 GET /api/health
+POST /api/conversation-turn
+POST /api/conversation-turn/stream
 ```
 
-返回：
+健康检查返回：
 
 ```json
 {
@@ -74,6 +94,27 @@ GET /api/health
   "service": "ai-vision-voice-chat-api"
 }
 ```
+
+`POST /api/conversation-turn/stream` 返回 `text/event-stream`：
+
+```text
+event: status
+data: {"phase":"validating"}
+
+event: delta
+data: {"text":"我看到"}
+
+event: complete
+data: {"ok":true,"reply":{"role":"assistant","text":"我看到..."}}
+```
+
+真实模型 smoke test：
+
+1. 设置 `MODEL_BASE_URL`、`MODEL_API_KEY`、`MODEL_NAME`。
+2. 运行 `npm run dev`。
+3. 用 Chrome 打开 Vite 页面，允许摄像头权限。
+4. 点击麦克风提问三轮，包含一次“它/左边那个”等指代追问。
+5. 确认回复文本流式出现、TTS 在完成后播报、错误/限流/成本状态可见。
 
 ## 核心设计
 
@@ -110,13 +151,8 @@ GET /api/health
 
 建议后续按以下顺序推进：
 
-1. 创建 Vite + React + TypeScript 前端和 Node/Express 后端骨架。
-2. 实现摄像头预览、权限状态和错误提示。
-3. 实现 Web Speech API 转写和浏览器兼容性提示。
-4. 实现关键帧截取、压缩和本地预览。
-5. 实现后端请求 schema、限流和成本估算。
-6. 实现 OpenAI-compatible 多模态 provider。
-7. 实现对话 UI、短期上下文和 TTS 播报。
-8. 实现调试区和成本统计。
-9. 补充端到端手工验收脚本和自动化测试。
-10. 根据真实实现结果更新设计文档中的当前实现记录和验收状态。
+1. 配置真实 `MODEL_*` 环境变量并做 Chrome 手工 smoke test。
+2. 验证三轮语音问答、指代追问、流式文本、TTS 播报和错误展示。
+3. 根据真实模型延迟和 token usage 调整 `MODEL_MAX_OUTPUT_TOKENS` 与成本估算参数。
+4. 记录目标 provider 对 `stream_options.include_usage` 的兼容性。
+5. 根据演示反馈决定是否增加云端 ASR/TTS 或多模型路由。
