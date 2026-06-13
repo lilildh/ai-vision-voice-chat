@@ -8,15 +8,22 @@ import {
   createConversationTurnHandler
 } from "./conversation-route";
 import { createZeroCost } from "./conversation-validation";
+import {
+  createOpenAiCompatibleMultimodalProvider,
+  type MultimodalProvider
+} from "./multimodal-provider";
 
 type CreateAppOptions = {
   costControlService?: CostControlService;
+  multimodalProvider?: MultimodalProvider;
 };
 
 export function createApp(options: CreateAppOptions = {}) {
   const app = express();
   const costControlService =
     options.costControlService ?? createCostControlService();
+  const multimodalProvider =
+    options.multimodalProvider ?? createOpenAiCompatibleMultimodalProvider();
 
   app.use(express.json({ limit: CONVERSATION_BODY_LIMIT }));
 
@@ -29,7 +36,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.post(
     "/api/conversation-turn",
-    createConversationTurnHandler(costControlService)
+    createConversationTurnHandler(costControlService, multimodalProvider)
   );
 
   app.use(

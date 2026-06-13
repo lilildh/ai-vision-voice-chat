@@ -1,8 +1,15 @@
+import { EventEmitter } from "node:events";
+
 import { createRequest, createResponse } from "node-mocks-http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../src/app";
 import { createCostControlService } from "../src/cost-control";
+import {
+  MultimodalProviderError,
+  type MultimodalProvider,
+  type MultimodalProviderRequest
+} from "../src/multimodal-provider";
 
 type RequestBody = {
   keyframes?: unknown[];
@@ -15,6 +22,7 @@ const originalModelEnv = {
   COST_INPUT_USD_PER_1M_TOKENS: process.env.COST_INPUT_USD_PER_1M_TOKENS,
   COST_OUTPUT_USD_PER_1M_TOKENS: process.env.COST_OUTPUT_USD_PER_1M_TOKENS,
   MODEL_MAX_OUTPUT_TOKENS: process.env.MODEL_MAX_OUTPUT_TOKENS,
+  MODEL_TIMEOUT_MS: process.env.MODEL_TIMEOUT_MS,
   MODEL_API_KEY: process.env.MODEL_API_KEY,
   MODEL_BASE_URL: process.env.MODEL_BASE_URL,
   MODEL_NAME: process.env.MODEL_NAME
@@ -55,10 +63,46 @@ function validRequestBody(overrides: RequestBody = {}) {
   };
 }
 
-function postConversationTurn(
-  body: unknown,
-  app = createApp()
-) {
+function setValidModelEnv(overrides: NodeJS.ProcessEnv = {}) {
+  process.env.MODEL_API_KEY = "test-key";
+  process.env.MODEL_BASE_URL = "https://model.example.test/v1";
+  process.env.MODEL_NAME = "vision-model";
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
+
+function createFakeMultimodalProvider(options: { rejectWith?: Error } = {}) {
+  const calls: MultimodalProviderRequest[] = [];
+  const provider: MultimodalProvider = {
+    async complete(request) {
+      calls.push(request);
+
+      if (options.rejectWith) {
+        throw options.rejectWith;
+      }
+
+      return {
+        modelMs: 12,
+        modelName: request.config.modelName,
+        provider: "openai-compatible",
+        text: "我看到一张桌面关键帧。"
+      };
+    }
+  };
+
+  return {
+    calls,
+    provider
+  };
+}
+
+async function postConversationTurn(body: unknown, app = createApp()) {
   const request = createRequest({
     body,
     headers: {
@@ -67,7 +111,10 @@ function postConversationTurn(
     method: "POST",
     url: "/api/conversation-turn"
   });
-  const response = createResponse();
+  const response = createResponse({ eventEmitter: EventEmitter });
+  const completed = new Promise<void>((resolve) => {
+    response.on("end", () => resolve());
+  });
 
   app.use((_request, fallbackResponse) => {
     fallbackResponse.status(404).json({
@@ -78,6 +125,7 @@ function postConversationTurn(
     });
   });
   app.handle(request, response);
+  await completed;
 
   return {
     body: response._getJSONData(),
@@ -100,6 +148,7 @@ describe("POST /api/conversation-turn", () => {
     delete process.env.MODEL_API_KEY;
     delete process.env.MODEL_BASE_URL;
     delete process.env.MODEL_NAME;
+    delete process.env.MODEL_TIMEOUT_MS;
     delete process.env.COST_IMAGE_TOKENS_PER_KEYFRAME;
     delete process.env.COST_INPUT_USD_PER_1M_TOKENS;
     delete process.env.COST_OUTPUT_USD_PER_1M_TOKENS;
@@ -110,8 +159,10 @@ describe("POST /api/conversation-turn", () => {
     restoreModelEnv();
   });
 
-  it("rejects empty text with an explicit error code", () => {
-    const response = postConversationTurn(validRequestBody({ text: "   " }));
+  it("rejects empty text with an explicit error code", async () => {
+    const response = await postConversationTurn(
+      validRequestBody({ text: "   " })
+    );
 
     expect(response.status).toBe(400);
     expect(response.body).toMatchObject({
@@ -128,8 +179,10 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("rejects requests without keyframes", () => {
-    const response = postConversationTurn(validRequestBody({ keyframes: [] }));
+  it("rejects requests without keyframes", async () => {
+    const response = await postConversationTurn(
+      validRequestBody({ keyframes: [] })
+    );
 
     expect(response.status).toBe(400);
     expect(response.body).toMatchObject({
@@ -140,14 +193,16 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("rejects more than three keyframes", () => {
+  it("rejects more than three keyframes", async () => {
     const keyframes = Array.from({ length: 4 }, (_, index) => ({
       capturedAt: "2026-06-12T07:30:00.000Z",
       dataUrl: imageDataUrl(),
       id: `frame-${index + 1}`
     }));
 
-    const response = postConversationTurn(validRequestBody({ keyframes }));
+    const response = await postConversationTurn(
+      validRequestBody({ keyframes })
+    );
 
     expect(response.status).toBe(400);
     expect(response.body).toMatchObject({
@@ -161,8 +216,8 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("rejects a keyframe larger than one megabyte", () => {
-    const response = postConversationTurn(
+  it("rejects a keyframe larger than one megabyte", async () => {
+    const response = await postConversationTurn(
       validRequestBody({
         keyframes: [
           {
@@ -186,8 +241,8 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("rejects non-image data URLs", () => {
-    const response = postConversationTurn(
+  it("rejects non-image data URLs", async () => {
+    const response = await postConversationTurn(
       validRequestBody({
         keyframes: [
           {
@@ -208,8 +263,8 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("rejects invalid base64 image payloads", () => {
-    const response = postConversationTurn(
+  it("rejects invalid base64 image payloads", async () => {
+    const response = await postConversationTurn(
       validRequestBody({
         keyframes: [
           {
@@ -230,8 +285,8 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("rejects valid requests when model configuration is missing", () => {
-    const response = postConversationTurn(validRequestBody());
+  it("rejects valid requests when model configuration is missing", async () => {
+    const response = await postConversationTurn(validRequestBody());
 
     expect(response.status).toBe(503);
     expect(response.body).toMatchObject({
@@ -246,58 +301,152 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("returns a provider-not-implemented failure when config and validation pass", () => {
-    process.env.MODEL_API_KEY = "test-key";
-    process.env.MODEL_BASE_URL = "https://model.example.test/v1";
-    process.env.MODEL_NAME = "vision-model";
+  it("rejects invalid model configuration before calling the provider", async () => {
+    setValidModelEnv({ MODEL_TIMEOUT_MS: "soon" });
+    const fake = createFakeMultimodalProvider();
 
-    const response = postConversationTurn(validRequestBody());
+    const response = await postConversationTurn(
+      validRequestBody(),
+      createApp({ multimodalProvider: fake.provider })
+    );
 
-    expect(response.status).toBe(501);
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      error: {
+        code: "MODEL_CONFIG_INVALID",
+        details: {
+          invalid: [
+            {
+              name: "MODEL_TIMEOUT_MS",
+              value: "soon"
+            }
+          ]
+        },
+        retryable: false
+      },
+      ok: false
+    });
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("returns a successful assistant reply from the configured provider", async () => {
+    setValidModelEnv({
+      MODEL_MAX_OUTPUT_TOKENS: "128",
+      MODEL_TIMEOUT_MS: "3000"
+    });
+    const fake = createFakeMultimodalProvider();
+
+    const response = await postConversationTurn(
+      validRequestBody(),
+      createApp({ multimodalProvider: fake.provider })
+    );
+
+    expect(response.status).toBe(200);
     expect(response.body).toMatchObject({
       cost: {
         request: {
-          cloudCallAttempted: false,
-          estimatedInputTokens: 852,
-          estimatedOutputTokens: 512,
-          estimatedUsd: 0.01194,
+          cloudCallAttempted: true,
           imageBytes: 5,
           inputTextChars: 7,
           keyframeCount: 1
         },
         session: {
-          estimatedUsd: 0.01194,
           keyframeCount: 1,
           requestCount: 1
         }
       },
+      model: {
+        name: "vision-model",
+        provider: "openai-compatible"
+      },
+      ok: true,
+      reply: {
+        role: "assistant",
+        text: "我看到一张桌面关键帧。"
+      },
+      timing: {
+        modelMs: 12
+      }
+    });
+    expect(response.body.session.turnId).toEqual(expect.any(String));
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]).toMatchObject({
+      config: {
+        apiKey: "test-key",
+        baseUrl: "https://model.example.test/v1",
+        maxOutputTokens: 128,
+        modelName: "vision-model",
+        timeoutMs: 3000
+      },
+      keyframes: [
+        {
+          byteLength: 5,
+          dataUrl: imageDataUrl(),
+          id: "frame-1"
+        }
+      ],
+      messages: [
+        {
+          role: "user",
+          text: "上一轮问题"
+        }
+      ],
+      text: "你看到了什么？"
+    });
+  });
+
+  it("returns an explicit error when the provider fails", async () => {
+    setValidModelEnv();
+    const providerError = new MultimodalProviderError({
+      code: "MODEL_PROVIDER_ERROR",
+      details: {
+        providerStatus: 502
+      },
+      message: "上游模型调用失败。",
+      retryable: true,
+      status: 502
+    });
+    const fake = createFakeMultimodalProvider({ rejectWith: providerError });
+
+    const response = await postConversationTurn(
+      validRequestBody(),
+      createApp({ multimodalProvider: fake.provider })
+    );
+
+    expect(response.status).toBe(502);
+    expect(response.body).toMatchObject({
+      cost: {
+        request: {
+          cloudCallAttempted: true
+        }
+      },
       error: {
-        code: "MODEL_PROVIDER_NOT_IMPLEMENTED",
-        retryable: false
+        code: "MODEL_PROVIDER_ERROR",
+        details: {
+          providerStatus: 502
+        },
+        message: "上游模型调用失败。",
+        retryable: true
       },
       ok: false
     });
   });
 
-  it("rejects the seventh valid request in the current minute", () => {
-    process.env.MODEL_API_KEY = "test-key";
-    process.env.MODEL_BASE_URL = "https://model.example.test/v1";
-    process.env.MODEL_NAME = "vision-model";
+  it("rejects the seventh valid request in the current minute", async () => {
+    setValidModelEnv();
+    const fake = createFakeMultimodalProvider();
+    const app = createApp({ multimodalProvider: fake.provider });
 
-    const app = createApp();
+    for (let index = 0; index < 6; index += 1) {
+      const response = await postConversationTurn(validRequestBody(), app);
 
-    Array.from({ length: 6 }, () => {
-      const response = postConversationTurn(validRequestBody(), app);
-
-      expect(response.status).toBe(501);
+      expect(response.status).toBe(200);
       expect(response.body).toMatchObject({
-        error: {
-          code: "MODEL_PROVIDER_NOT_IMPLEMENTED"
-        }
+        ok: true
       });
-    });
+    }
 
-    const response = postConversationTurn(validRequestBody(), app);
+    const response = await postConversationTurn(validRequestBody(), app);
 
     expect(response.status).toBe(429);
     expect(response.body).toMatchObject({
@@ -314,29 +463,26 @@ describe("POST /api/conversation-turn", () => {
     expect(response.body.error.details.retryAfterMs).toBeGreaterThan(0);
   });
 
-  it("rejects the twenty-first valid turn in one session", () => {
-    process.env.MODEL_API_KEY = "test-key";
-    process.env.MODEL_BASE_URL = "https://model.example.test/v1";
-    process.env.MODEL_NAME = "vision-model";
-
+  it("rejects the twenty-first valid turn in one session", async () => {
+    setValidModelEnv();
+    const fake = createFakeMultimodalProvider();
     const app = createApp({
       costControlService: createCostControlService({
         rateLimit: { limit: 100, windowMs: 60_000 }
-      })
+      }),
+      multimodalProvider: fake.provider
     });
 
-    Array.from({ length: 20 }, () => {
-      const response = postConversationTurn(validRequestBody(), app);
+    for (let index = 0; index < 20; index += 1) {
+      const response = await postConversationTurn(validRequestBody(), app);
 
-      expect(response.status).toBe(501);
+      expect(response.status).toBe(200);
       expect(response.body).toMatchObject({
-        error: {
-          code: "MODEL_PROVIDER_NOT_IMPLEMENTED"
-        }
+        ok: true
       });
-    });
+    }
 
-    const response = postConversationTurn(validRequestBody(), app);
+    const response = await postConversationTurn(validRequestBody(), app);
 
     expect(response.status).toBe(429);
     expect(response.body).toMatchObject({
@@ -353,13 +499,11 @@ describe("POST /api/conversation-turn", () => {
     });
   });
 
-  it("rejects invalid cost configuration with an explicit error", () => {
-    process.env.MODEL_API_KEY = "test-key";
-    process.env.MODEL_BASE_URL = "https://model.example.test/v1";
-    process.env.MODEL_NAME = "vision-model";
+  it("rejects invalid cost configuration with an explicit error", async () => {
+    setValidModelEnv();
     process.env.COST_OUTPUT_USD_PER_1M_TOKENS = "free";
 
-    const response = postConversationTurn(validRequestBody());
+    const response = await postConversationTurn(validRequestBody());
 
     expect(response.status).toBe(503);
     expect(response.body).toMatchObject({

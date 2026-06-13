@@ -67,8 +67,10 @@ export type ConversationTurnErrorCode =
   | "RATE_LIMITED"
   | "SESSION_TURN_LIMIT_EXCEEDED"
   | "COST_CONFIG_INVALID"
+  | "MODEL_CONFIG_INVALID"
   | "MODEL_CONFIG_MISSING"
-  | "MODEL_PROVIDER_NOT_IMPLEMENTED";
+  | "MODEL_PROVIDER_ERROR"
+  | "MODEL_PROVIDER_TIMEOUT";
 
 export type ConversationTurnErrorResponse = {
   ok: false;
